@@ -220,6 +220,11 @@ def create_dataset(config: OmegaConf, val: bool = False):
             additional_params = OmegaConf.to_object(config.dataset.params)
             params.update(additional_params)
 
+        # Allow an explicit validation dataset override (e.g. test_quick mirror)
+        if val and hasattr(config.dataset, 'val_params'):
+            val_params = OmegaConf.to_object(config.dataset.val_params)
+            params.update(val_params)
+
         # Set validation flag
         params['val'] = val
         
@@ -241,13 +246,15 @@ def _process_vlm_inputs_batch(vlm_inputs: List[Dict[str, Any]]) -> Dict[str, tor
     pixel_values_list = [vlm_input.get('pixel_values') for vlm_input in vlm_inputs]
     image_grid_thw_list = [vlm_input.get('image_grid_thw') for vlm_input in vlm_inputs]
     attention_mask_list = [vlm_input.get('attention_mask') for vlm_input in vlm_inputs]
+    mm_token_type_ids_list = [vlm_input.get('mm_token_type_ids') for vlm_input in vlm_inputs]
     
     # Pad input_ids to same length (simplified like model implementation)
     max_seq_len = max(ids.shape[1] for ids in input_ids_list)
     padded_input_ids = []
     padded_attention_masks = []
+    padded_mm_token_type_ids = []
     
-    for ids, mask in zip(input_ids_list, attention_mask_list):
+    for ids, mask, mm_token_type_ids in zip(input_ids_list, attention_mask_list, mm_token_type_ids_list):
         if ids.shape[1] < max_seq_len:
             padding_size = max_seq_len - ids.shape[1]
             # Pad input_ids
@@ -259,12 +266,21 @@ def _process_vlm_inputs_batch(vlm_inputs: List[Dict[str, Any]]) -> Dict[str, tor
                 padded_mask = torch.cat([mask, mask_padding], dim=1)
             else:
                 padded_mask = None
+            if mm_token_type_ids is not None:
+                mm_padding = torch.zeros(
+                    mm_token_type_ids.shape[0], padding_size, dtype=mm_token_type_ids.dtype, device=mm_token_type_ids.device
+                )
+                padded_mm = torch.cat([mm_token_type_ids, mm_padding], dim=1)
+            else:
+                padded_mm = None
         else:
             padded_ids = ids
             padded_mask = mask
+            padded_mm = mm_token_type_ids
             
         padded_input_ids.append(padded_ids)
         padded_attention_masks.append(padded_mask)
+        padded_mm_token_type_ids.append(padded_mm)
     
     # Batch everything
     return {
@@ -272,6 +288,7 @@ def _process_vlm_inputs_batch(vlm_inputs: List[Dict[str, Any]]) -> Dict[str, tor
         'pixel_values': torch.cat([pv for pv in pixel_values_list if pv is not None], dim=0) if pixel_values_list and any(pv is not None for pv in pixel_values_list) else None,
         'image_grid_thw': torch.cat([igt for igt in image_grid_thw_list if igt is not None], dim=0) if image_grid_thw_list and any(igt is not None for igt in image_grid_thw_list) else None,
         'attention_mask': torch.cat([mask for mask in padded_attention_masks if mask is not None], dim=0) if any(mask is not None for mask in padded_attention_masks) else None,
+        'mm_token_type_ids': torch.cat([mm for mm in padded_mm_token_type_ids if mm is not None], dim=0) if any(mm is not None for mm in padded_mm_token_type_ids) else None,
     }
 
 

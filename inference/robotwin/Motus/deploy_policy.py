@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import cv2
+import json
 from pathlib import Path
 import sys
 import os
@@ -30,6 +31,7 @@ if BAK_ROOT not in sys.path:
 
 from wan.modules.t5 import T5EncoderModel
 from utils.image_utils import resize_with_padding
+from utils.vlm_utils import preprocess_vlm_messages
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +41,17 @@ class MotusPolicy:
     Implements the joint video-action diffusion model for robotic control.
     """
     
-    def __init__(self, checkpoint_path: str, config_path: str, wan_path: str, vlm_path: str, device: str = "cuda", log_dir: Optional[str] = None, task_name: Optional[str] = None):
+    def __init__(
+        self,
+        checkpoint_path: str,
+        config_path: str,
+        wan_path: str,
+        vlm_path: str,
+        device: str = "cuda",
+        log_dir: Optional[str] = None,
+        task_name: Optional[str] = None,
+        eval_result_root: Optional[str] = None,
+    ):
         self.device = device
         self.checkpoint_path = checkpoint_path
         self.wan_path = wan_path
@@ -83,6 +95,10 @@ class MotusPolicy:
         task_dir_name = task_name or os.environ.get('TASK_NAME') or "default_task"
         self.save_dir = Path(base_log_dir) / "images" / task_dir_name
         self.save_dir.mkdir(parents=True, exist_ok=True)
+        debug_root = Path(eval_result_root) if eval_result_root else Path(base_log_dir)
+        self.action_debug_dir = debug_root / "action_debug"
+        self.action_debug_dir.mkdir(parents=True, exist_ok=True)
+        self.action_summary_path = self.action_debug_dir / "actions.jsonl"
         self.episode_count = 0
         self.step_count = 0
 
@@ -273,11 +289,78 @@ class MotusPolicy:
                 self._save_frame_grid(condition_frame_viz, predicted_frames_viz)
                 self.step_count += 1
 
-        actions_real = predicted_actions.squeeze(0).cpu().numpy()
+        raw_actions = predicted_actions.squeeze(0).detach()
+        sanitized_actions = self._sanitize_actions(raw_actions)
+        self._record_action_debug(raw_actions, sanitized_actions)
+        actions_real = sanitized_actions.cpu().numpy()
         self.prev_action = actions_real[-1].copy()
         self.action_cache.extend(actions_real)
 
         return actions_real
+
+    def _record_action_debug(self, raw_actions: torch.Tensor, sanitized_actions: torch.Tensor):
+        """Persist action chunks and summaries for each rollout step."""
+        current_state = self.current_state.squeeze(0).detach().cpu().float()
+        raw_cpu = raw_actions.detach().cpu().float()
+        sanitized_cpu = sanitized_actions.detach().cpu().float()
+        delta_cpu = sanitized_cpu - current_state.unsqueeze(0)
+
+        episode_idx = max(self.episode_count, 1)
+        step_idx = self.step_count
+        npz_path = self.action_debug_dir / f"episode_{episode_idx:04d}_step_{step_idx:04d}.npz"
+        np.savez_compressed(
+            npz_path,
+            current_state=current_state.numpy(),
+            raw_actions=raw_cpu.numpy(),
+            sanitized_actions=sanitized_cpu.numpy(),
+            delta_from_state=delta_cpu.numpy(),
+        )
+
+        summary = {
+            "episode": episode_idx,
+            "step": step_idx,
+            "instruction": self.current_instruction,
+            "current_state": current_state.tolist(),
+            "raw_min": float(raw_cpu.min().item()),
+            "raw_max": float(raw_cpu.max().item()),
+            "raw_std": float(raw_cpu.std().item()),
+            "sanitized_min": float(sanitized_cpu.min().item()),
+            "sanitized_max": float(sanitized_cpu.max().item()),
+            "sanitized_std": float(sanitized_cpu.std().item()),
+            "delta_abs_mean": float(delta_cpu.abs().mean().item()),
+            "delta_abs_max": float(delta_cpu.abs().max().item()),
+            "first_action": sanitized_cpu[0].tolist(),
+            "last_action": sanitized_cpu[-1].tolist(),
+            "left_gripper_first": float(sanitized_cpu[0][6].item()),
+            "right_gripper_first": float(sanitized_cpu[0][13].item()),
+        }
+
+        with open(self.action_summary_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(summary, ensure_ascii=True) + "\n")
+
+    def _sanitize_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        """Clamp actions to valid qpos range and replace invalid values."""
+        actions = actions.float()
+
+        fallback = self.current_state.squeeze(0).float()
+        if self.prev_action is not None:
+            fallback = torch.from_numpy(self.prev_action).to(self.device).float()
+        fallback = fallback.unsqueeze(0).expand_as(actions)
+
+        invalid_mask = ~torch.isfinite(actions)
+        if invalid_mask.any():
+            invalid_count = int(invalid_mask.sum().item())
+            logger.warning(f"Replacing {invalid_count} invalid action values with fallback state")
+            actions = torch.where(invalid_mask, fallback, actions)
+
+        min_vals = self.action_min.unsqueeze(0).expand_as(actions)
+        max_vals = self.action_max.unsqueeze(0).expand_as(actions)
+        clipped = torch.clamp(actions, min=min_vals, max=max_vals)
+
+        if not torch.equal(clipped, actions):
+            logger.warning("Clipped action chunk to robotwin stat bounds")
+
+        return clipped
 
     def _tensor_to_pil_image(self, tensor_chw: torch.Tensor) -> Image.Image:
         """Convert [C, H, W] tensor to PIL Image."""
@@ -288,27 +371,12 @@ class MotusPolicy:
         return Image.fromarray(np_img, mode='RGB')
 
     def _preprocess_vlm_messages(self, instruction: str, image: Image.Image) -> Dict[str, torch.Tensor]:
-        """Build VLM inputs."""
-        messages = [
-            {
-                'role': 'user',
-                'content': [
-                    {'type': 'text', 'text': instruction},
-                    {'type': 'image', 'image': image},
-                ]
-            }
-        ]
-        text = self.vlm_processor.apply_chat_template(messages, add_generation_prompt=False, tokenize=False)
-        encoded = self.vlm_processor(text=[text], images=[image], return_tensors='pt')
-        vlm_inputs = {
-            'input_ids': encoded['input_ids'].to(self.device),
-            'attention_mask': encoded['attention_mask'].to(self.device), 
-            'pixel_values': encoded['pixel_values'].to(self.device),
-            'image_grid_thw': encoded.get('image_grid_thw', None)
+        """Build VLM inputs using the same preprocessing path as training."""
+        encoded = preprocess_vlm_messages(instruction, image, self.vlm_processor)
+        return {
+            k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+            for k, v in encoded.items()
         }
-        if vlm_inputs['image_grid_thw'] is not None:
-            vlm_inputs['image_grid_thw'] = vlm_inputs['image_grid_thw'].to(self.device)
-        return vlm_inputs
 
     def _load_normalization_stats(self):
         """Load action normalization stats."""
@@ -350,6 +418,7 @@ class MotusPolicy:
             if tensor.dim() == 3:
                 tensor = tensor.permute(1, 2, 0)
             tensor = tensor.detach().cpu().float()
+            tensor = torch.nan_to_num(tensor, nan=0.0, posinf=1.0, neginf=0.0)
             tensor = torch.clamp(tensor, 0, 1)
             return (tensor.numpy() * 255).astype(np.uint8)
         
@@ -417,7 +486,8 @@ def get_model(usr_args):
         config_path=str(config_path),
         device=device,
         log_dir=usr_args.get('log_dir'),
-        task_name=usr_args.get('task_name')
+        task_name=usr_args.get('task_name'),
+        eval_result_root=usr_args.get('eval_result_root'),
     )
     
     return policy

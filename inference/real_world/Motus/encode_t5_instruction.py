@@ -36,7 +36,7 @@ def main():
     parser.add_argument(
         "--wan_path",
         type=str,
-        default="/share/home/bhz/pretrained_models",
+        default="/mnt/gyc_ckp",
         help="Path to WAN pretrained models directory"
     )
     parser.add_argument(
@@ -100,4 +100,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

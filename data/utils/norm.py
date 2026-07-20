@@ -102,6 +102,67 @@ def load_normalization_stats(stats_path: str, dataset_name: str) -> Tuple[Option
         return None, None
 
 
+def load_action_state_normalization_stats(
+    stats_path: str,
+    dataset_name: str,
+    state_key: str = "observation.state",
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Load action/state normalization statistics from file for the specified dataset.
+
+    Supported JSON layouts:
+    1) Legacy shared min/max:
+       {
+         "dataset_name": {"min": [...], "max": [...]}
+       }
+    2) Explicit action/state stats:
+       {
+         "dataset_name": {
+           "action": {"min": [...], "max": [...]},
+           "observation.state": {"min": [...], "max": [...]}
+         }
+       }
+    """
+    try:
+        import json
+        with open(stats_path, 'r') as f:
+            stats = json.load(f)
+
+        if dataset_name not in stats:
+            raise KeyError(f"Dataset '{dataset_name}' not found in normalization stats file")
+
+        dataset_stats = stats[dataset_name]
+        if "action" in dataset_stats and state_key in dataset_stats:
+            action_stats = dataset_stats["action"]
+            state_stats = dataset_stats[state_key]
+            action_min = np.array(action_stats["min"], dtype=np.float32)
+            action_max = np.array(action_stats["max"], dtype=np.float32)
+            state_min = np.array(state_stats["min"], dtype=np.float32)
+            state_max = np.array(state_stats["max"], dtype=np.float32)
+        elif "min" in dataset_stats and "max" in dataset_stats:
+            action_min = np.array(dataset_stats["min"], dtype=np.float32)
+            action_max = np.array(dataset_stats["max"], dtype=np.float32)
+            state_min = action_min.copy()
+            state_max = action_max.copy()
+        else:
+            raise KeyError(
+                f"Dataset '{dataset_name}' stats must contain either "
+                "'min'/'max' or explicit 'action'/'{state_key}' entries"
+            )
+
+        logger.info(f"Loaded action/state normalization stats for {dataset_name} from {stats_path}")
+        logger.info(f"  Action range shape: {action_min.shape}")
+        logger.info(f"  State range shape: {state_min.shape}")
+        return action_min, action_max, state_min, state_max
+
+    except FileNotFoundError:
+        logger.warning(f"Normalization stats file not found: {stats_path}")
+        return None, None, None, None
+    except Exception as e:
+        logger.error(f"Error loading action/state stats from {stats_path}: {e}")
+        return None, None, None, None
+
+
 def load_quantile_stats(
     stats_path: str,
     dataset_name: str,
@@ -193,4 +254,3 @@ def normalize_actions_with_quantiles(
 
     normalized = (x - q_low) / q_range
     return torch.from_numpy(normalized).float()
-

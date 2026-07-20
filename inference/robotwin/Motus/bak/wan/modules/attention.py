@@ -51,10 +51,34 @@ def flash_attention(
     """
     half_dtypes = (torch.float16, torch.bfloat16)
     assert dtype in half_dtypes
-    assert q.device.type == 'cuda' and q.size(-1) <= 256
 
     # params
     b, lq, lk, out_dtype = q.size(0), q.size(1), k.size(1), q.dtype
+
+    if not (FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE):
+        if q_lens is not None or k_lens is not None:
+            warnings.warn(
+                'Padding mask is disabled when falling back to scaled_dot_product_attention. '
+                'It can have a significant impact on performance.'
+            )
+        if window_size != (-1, -1):
+            warnings.warn(
+                'Sliding-window attention is disabled when flash attention is unavailable. '
+                'Falling back to full scaled_dot_product_attention.'
+            )
+        if q_scale is not None:
+            q = q * q_scale
+
+        q = q.transpose(1, 2).to(dtype if q.dtype not in half_dtypes else q.dtype)
+        k = k.transpose(1, 2).to(dtype if k.dtype not in half_dtypes else k.dtype)
+        v = v.transpose(1, 2).to(dtype if v.dtype not in half_dtypes else v.dtype)
+
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=None, is_causal=causal, dropout_p=dropout_p
+        )
+        return out.transpose(1, 2).contiguous().type(out_dtype)
+
+    assert q.device.type == 'cuda' and q.size(-1) <= 256
 
     def half(x):
         return x if x.dtype in half_dtypes else x.to(dtype)
@@ -109,7 +133,6 @@ def flash_attention(
             causal=causal,
             deterministic=deterministic)[0].unflatten(0, (b, lq))
     else:
-        assert FLASH_ATTN_2_AVAILABLE
         x = flash_attn.flash_attn_varlen_func(
             q=q,
             k=k,

@@ -2,10 +2,17 @@
 # Define your env settings here 
 # e.g., nccl, network, proxy, etc.
 
-TASK="robotwin"  # Define your task name here
-CONFIG_FILE="configs/robotwin.yaml"  # Define your dataset config path here
+TASK="${TASK:-action_following_rot6d20_clean_only_stage3}"  # Define your task name here
+CONFIG_FILE="${CONFIG_FILE:-configs/action_following_lerobot_rot6d20_clean_only.yaml}"  # Define your dataset config path here
+NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+MASTER_PORT="${MASTER_PORT:-29501}"
+TORCHRUN="${TORCHRUN:-/mnt/gyc/miniconda3/envs/motus/bin/torchrun}"
 
-export OUTPUT_DIR="outputs/motus-${TASK}" # Define your output directory here
+export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/mnt/gyc/wth-Motus/.cache/hf_datasets}"
+export HF_HOME="${HF_HOME:-/mnt/gyc/wth-Motus/.cache/huggingface}"
+
+export OUTPUT_DIR="${OUTPUT_DIR:-outputs/motus-${TASK}}" # Define your output directory here
 
 if [ ! -d "$OUTPUT_DIR" ]; then
     mkdir -p "$OUTPUT_DIR"
@@ -15,12 +22,12 @@ else
 fi
 
 # Single-node training with torchrun
-torchrun \
+"${TORCHRUN}" \
     --nnodes=1 \
-    --nproc_per_node=8 \
+    --nproc_per_node="${NPROC_PER_NODE}" \
     --node_rank=0 \
     --master_addr=127.0.0.1 \
-    --master_port=29500 \
+    --master_port="${MASTER_PORT}" \
     train/train.py \
     --deepspeed configs/zero1.json \
     --config $CONFIG_FILE \

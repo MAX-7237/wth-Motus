@@ -1,0 +1,171 @@
+common:
+  action_dim: 20
+  state_dim: 20
+
+  num_video_frames: 8
+  video_height: 384
+  video_width: 320
+
+  global_downsample_rate: 1
+  video_action_freq_ratio: 6
+
+training_mode: "finetune"
+
+dataset:
+  type: "lerobot"
+  max_episodes: null
+  image_aug: false
+
+  task_mode: "multi"
+  task_name: null
+
+  params:
+    repo_id: "ActionFollowingData_LeRobot_Rot6D_mix"
+    root: "/mnt/public_ckp/cscsx_projects/data/ActionFollowingData_LeRobot_Rot6D_nosymlink/train"
+
+    embodiment_type: "action_following_rot6d20_mix_4_1_1_1_1"
+    normalization_stats_path: "/mnt/gyc/wth-Motus/data/utils/action_following_rot6d20_stats.json"
+    normalization_dataset_key: "action_following_rot6d20_mix_4_1_1_1_1"
+    normalize_action_state: true
+
+    sampling_groups:
+      - name: "clean"
+        weight: 4
+        root: "demo_clean_zed2i_visible"
+      - name: "counterfactual_replay"
+        weight: 1
+        root: "counterfactual_replay/tasks"
+      - name: "exploration"
+        weight: 1
+        root: "exploration/tasks"
+      - name: "perturbed"
+        weight: 1
+        roots:
+          - "perturbed/raw/tasks"
+          - "perturbed/pca/tasks"
+      - name: "random_feasible"
+        weight: 1
+        roots:
+          - "random_feasible/uniform/tasks"
+          - "random_feasible/weighted/tasks"
+
+    enable_t5_fallback: true
+    t5_wan_path: "/mnt/gyc_ckp"
+    t5_folder_name: "t5_embedding"
+    t5_text_len: 512
+
+  val_params:
+    repo_id: "ActionFollowingData_LeRobot_Rot6D_mix"
+    root: "/mnt/public_ckp/cscsx_projects/data/ActionFollowingData_LeRobot_Rot6D_nosymlink/train"
+    task_mode: "multi"
+    task_name: null
+    normalization_stats_path: "/mnt/gyc/wth-Motus/data/utils/action_following_rot6d20_stats.json"
+    normalization_dataset_key: "action_following_rot6d20_mix_4_1_1_1_1"
+    normalize_action_state: true
+    sampling_groups:
+      - name: "clean"
+        weight: 4
+        root: "demo_clean_zed2i_visible"
+      - name: "counterfactual_replay"
+        weight: 1
+        root: "counterfactual_replay/tasks"
+      - name: "exploration"
+        weight: 1
+        root: "exploration/tasks"
+      - name: "perturbed"
+        weight: 1
+        roots:
+          - "perturbed/raw/tasks"
+          - "perturbed/pca/tasks"
+      - name: "random_feasible"
+        weight: 1
+        roots:
+          - "random_feasible/uniform/tasks"
+          - "random_feasible/weighted/tasks"
+    max_episodes: 200
+
+model:
+  wan:
+    config_path: "/mnt/gyc_ckp/Wan2.2-TI2V-5B"
+    checkpoint_path: "/mnt/gyc_ckp/Wan2.2-TI2V-5B"
+    vae_path: "/mnt/gyc_ckp/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+    precision: "bfloat16"
+
+  vlm:
+    checkpoint_path: "./pretrained_models/Qwen3-VL-2B-Instruct"
+    precision: "bfloat16"
+    frozen: true
+
+  action_expert:
+    hidden_size: 1024
+    ffn_dim_multiplier: 4
+    norm_eps: 1e-5
+
+  und_expert:
+    hidden_size: 512
+    ffn_dim_multiplier: 4
+    norm_eps: 1e-5
+    vlm:
+      input_dim: 2048
+      projector_type: "mlp3x_silu"
+
+  time_distribution:
+    timestep_sample_method: "logit_normal"
+    sigmoid_scale: 1.0
+    min_t: 0.0
+    max_t: 1.0
+
+  inference:
+    num_inference_timesteps: 10
+
+  loss_weights:
+    video_loss_weight: 1.0
+    action_loss_weight: 1.0
+
+  ema:
+    enabled: false
+    update_after_step: 0
+    inv_gamma: 1.0
+    power: 0.75
+    min_value: 0.0
+    max_value: 0.9999
+
+training:
+  batch_size: 8
+  gradient_accumulation_steps: 1
+  max_steps: 40000
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+
+  scheduler_type: "linear"
+  warmup_steps: 200
+  cycle_length: 1000000
+  f_max: 0.99
+  f_min: 0.4
+
+  grad_clip_norm: 0.5
+  use_amp: true
+  find_unused_parameters: false
+
+system:
+  checkpoint_dir: "./checkpoints"
+  log_level: "INFO"
+
+  log_interval: 1
+  save_interval: 5000
+  val_interval: 500
+
+  num_workers: 16
+  pin_memory: true
+
+logging:
+  report_to: "tensorboard"
+  wandb_project: "motus_action_following_rot6d20"
+  tensorboard_log_dir: "tensorboard_logs"
+  run_name: "action_following_rot6d20_mix_4_1_1_1_1_stage3"
+
+resume:
+  checkpoint_path: null
+
+finetune:
+  checkpoint_path: "/mnt/gyc/wth-Motus/pretrained_models/Motus"

@@ -135,9 +135,12 @@ def build_vlm_inputs(processor, instruction: str, image: Image.Image, device: to
     vlm_inputs = {
         'input_ids': encoded['input_ids'].to(device),
         'attention_mask': encoded['attention_mask'].to(device),
+        'mm_token_type_ids': encoded.get('mm_token_type_ids', None),
         'pixel_values': encoded['pixel_values'].to(device),
         'image_grid_thw': encoded.get('image_grid_thw', None)
     }
+    if vlm_inputs['mm_token_type_ids'] is not None:
+        vlm_inputs['mm_token_type_ids'] = vlm_inputs['mm_token_type_ids'].to(device)
     if vlm_inputs['image_grid_thw'] is not None:
         vlm_inputs['image_grid_thw'] = vlm_inputs['image_grid_thw'].to(device)
     return vlm_inputs

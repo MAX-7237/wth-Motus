@@ -4,13 +4,13 @@
 # ============================================================================
 # Core Paths - MUST MODIFY THESE
 # ============================================================================
-robotwin_root: "..."     # e.g., "/path/to/RoboTwin"
-conda_env: "..."         # e.g., "/path/to/miniconda3/envs/RoboTwin"
-checkpoint_path: "..."   # (directory containing mp_rank_00_model_states.pt)
+robotwin_root: "/mnt/gyc/RoboTwin"     # e.g., "/path/to/RoboTwin"
+conda_env: "/mnt/gyc/miniconda3/envs/robotwin_wth"         # e.g., "/path/to/miniconda3/envs/RoboTwin"
+checkpoint_path: "/mnt/gyc/wth-Motus/pretrained_models/Motus_robotwin2"   # (directory containing mp_rank_00_model_states.pt)
 
 # Pretrained model paths (only for loading configs, not weights)
-wan_path: "..."          # e.g., "/path/to/Wan2.2-TI2V-5B"
-vlm_path: "..."    # e.g., "/path/to/Qwen3-VL-2B-Instruct"
+wan_path: "/mnt/gyc_ckp/Wan2.2-TI2V-5B"          # e.g., "/path/to/Wan2.2-TI2V-5B"
+vlm_path: "/mnt/gyc/wth-Motus/pretrained_models/Qwen3-VL-2B-Instruct"    # e.g., "/path/to/Qwen3-VL-2B-Instruct"
 
 # ============================================================================
 # Optional Configuration

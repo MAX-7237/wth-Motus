@@ -1,0 +1,392 @@
+ActionFollowingData 数据资产公约
+更新时间：2026-07-13
+
+本文档是 ActionFollowingData 的训练数据公约。它只保留后续 agent / human 需要遵守的稳定规则：数据入口、格式、RGB 约定、train/test/test_quick 协议、采样协议和资产统计。历史审计与执行流水不写在本文档里；需要追溯时看 docs/control.md、docs/exp/*、相关脚本和日志路径。
+
+Canonical 路径
+用途	路径
+enhanced canonical root, Euler/source, 14D	/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingData
+enhanced train/test/test_quick root, Euler/source, 14D	/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingData/enhanced_v1_split
+enhanced Rot6D root, original ActionFollowingData format, 20D	/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingData_Rot6D
+enhanced Rot6D train/test/test_quick root, original ActionFollowingData format, 20D	/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingData_Rot6D/enhanced_v1_split
+expert clean LeRobot source, Euler/source, 14D	/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingBench/data_lerobot/robotwin_delta_ee/demo_clean_zed2i_visible
+expert randomized 500 LeRobot source, Euler/source, 14D	/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingBench/data_lerobot/robotwin_delta_ee/demo_randomized_zed2i_visible
+expert randomized 500 LeRobot Rot6D, 20D	/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingBench/data_lerobot_rot6d/robotwin_delta_ee/demo_randomized_zed2i_visible
+starVLA LeRobot mirror, Euler/source, 14D	/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingData_LeRobot
+starVLA LeRobot mirror, Rot6D, 20D	/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingData_LeRobot_Rot6D
+从 2026-07-07 起，默认新训练入口使用 Rot6D/20D。历史 Euler/source roots 保留用于追溯、兼容旧 run、重新派生或对照审计。
+
+默认新训练入口：
+
+LeRobot full clean+enhanced, Rot6D/20D:
+/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingData_LeRobot_Rot6D
+
+original ActionFollowingData enhanced train, Rot6D/20D:
+/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingData_Rot6D/enhanced_v1_split/train
+历史 Euler/source 入口：
+
+expert clean:
+/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingBench/data_lerobot/robotwin_delta_ee/demo_clean_zed2i_visible
+
+expert randomized 500:
+/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingBench/data_lerobot/robotwin_delta_ee/demo_randomized_zed2i_visible
+
+enhanced train:
+/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingData/enhanced_v1_split/train
+enhanced_v1_split/train 默认包含所有 enhanced 类别，包括 exploration。
+
+默认快速测试入口：
+
+Rot6D/20D:
+/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingData_Rot6D/enhanced_v1_split/test_quick
+
+Euler/source, 14D:
+/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingData/enhanced_v1_split/test_quick
+非特殊要求，不使用完整 test/ 做日常测试；test/ 是 full held-out pool，只在 final / full test 时使用。
+
+动作空间公约
+自 2026-07-07 本条记录起，ActionFollowingData 后续新训练、数据加载、配置命名和结果记录默认使用 6D rotation / rot6d 动作空间；此前已训练和已评测的 run 默认按历史 Euler XYZ 动作空间理解。后续如需继续使用历史 Euler root，必须在 run name / 配置 / 文档中显式标注 Euler 或 14D。
+
+历史 Euler/source 动作空间为 14D：
+
+[left_dx, left_dy, left_dz, left_droll, left_dpitch, left_dyaw, left_gripper,
+ right_dx, right_dy, right_dz, right_droll, right_dpitch, right_dyaw, right_gripper]
+当前 Rot6D 动作空间为 20D：
+
+[left_dx, left_dy, left_dz,
+ left_r00, left_r10, left_r20, left_r01, left_r11, left_r21,
+ left_gripper,
+ right_dx, right_dy, right_dz,
+ right_r00, right_r10, right_r20, right_r01, right_r11, right_r21,
+ right_gripper]
+Rot6D 约定：
+
+rot6d = concat(R[:,0], R[:,1])
+      = [r00, r10, r20, r01, r11, r21]
+其中 R 是 scipy Rotation.as_matrix() 输出的旋转矩阵；历史 droll/dpitch/dyaw 使用 Euler order xyz。训练代码切换到 Rot6D root 时必须显式设置 action_dim=20 / state_dim=20，不得继续沿用旧 14 维配置。
+
+两个当前 Rot6D root 的动作空间语义一致，区别只在容器格式：
+
+root	格式	action/state 存储
+/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingData_LeRobot_Rot6D	LeRobot dataset	parquet 中的 action / observation.state 为 20D，并同步更新 meta/info.json、meta/modality.json、meta/stats.json、meta/stats_gr00t.json
+/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingBench/data_lerobot_rot6d/robotwin_delta_ee/demo_randomized_zed2i_visible	flat LeRobot task datasets	50 个 task 目录的 parquet 中 action / observation.state 为 20D；非 action/state 资产已物理化为真实文件/目录，root 内无 symlink
+/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingData_Rot6D	original ActionFollowingData sample dirs	action.npy 与 HDF5 delta_ee_action/vector 为 20D；HDF5 delta_ee_state/vector 为 20D；非 action/state HDF5 payload 用 external links 指向 source root
+Robot frame 坐标系公约
+ActionFollowingData / RoboTwin 来源数据的训练用 action 与 state 统一按 robot base frame 解释。该规则覆盖 expert clean、expert randomized 500、enhanced 四类数据，以及 Euler/source 14D root 和 Rot6D/20D 派生 root。
+
+训练用字段包括：
+
+LeRobot parquet 中的 action。
+LeRobot parquet 中的 observation.state。
+original ActionFollowingData 中的 action.npy。
+original ActionFollowingData HDF5 中的 delta_ee_action/vector。
+original ActionFollowingData HDF5 中的 delta_ee_state/vector。
+当前 aloha-agilex embodiment 下，两臂共享同一个 robot base frame；左臂和右臂的 action/state 不是各自独立的 arm-local frame。robot base frame 轴向约定为：
+
++X = robot forward / 机器人前方
++Y = robot left    / 机器人左方
++Z = robot up      / 机器人上方
+因此，所有 dx/dy/dz 和 state 里的 x/y/z 都按上述 robot base frame 解释。Euler/source 14D 中的 droll/dpitch/dyaw 使用同一 robot base frame 下的 Euler xyz 口径；Rot6D/20D 只把旋转表示从 Euler 换成 rot6d = concat(R[:,0], R[:,1])，不改变坐标系语义。
+
+后续 converter、loader、训练配置和实验记录不得把这些 action/state 解释为 camera frame、wrist frame、per-arm local frame 或其它临时坐标系。若新增非 aloha-agilex embodiment，必须先在本文档中新增对应 robot base frame 轴向说明，再允许作为训练入口。
+
+数据分类
+大类	子类	是否 enhanced	粒度	状态
+expert clean	clean	否	trajectory level	source 保持原 LeRobot 14D；新训练默认使用 LeRobot Rot6D mirror 中的 clean
+expert randomized 500	demo_randomized_zed2i_visible	否	trajectory level	source LeRobot 14D 经运维拉回后已恢复完整：50 tasks × 500 episodes，video refs 596/596 存在；Rot6D flat root 已于 2026-07-09 从恢复后的 source 重建并替换正式路径，action/state=20D、frames=5,532,094、mp4=596、symlinks=0、missing_video_refs_vs_source=0。2026-07-09 已将正式 Rot6D root 内全部 mp4 从 AV1 原地重编码为 H.264/yuv420p，逐文件保持 source frame count / size / frame rate 一致，并通过 starVLA decord 0.6.0 全量读取复验；可用于 Rot6D/20D + decord/LRU 训练
+perturbed	pca, raw	是	chunk level	已迁移，已 split
+random feasible	uniform, weighted	是	trajectory level	已迁移，已 split
+counterfactual replay	default	是	trajectory level	已迁移，已 split
+exploration	policy rollouts	是	trajectory level	已迁移，已 split
+术语约定：
+
+enhanced data 默认包含四类：perturbed + random feasible + counterfactual replay + exploration。
+exploration 是 policy rollout 类 enhanced data，当前来自 StarVLA policy rollout。
+本文所有“enhanced / 所有 enhanced / enhanced data”均包含 exploration；任何训练、统计、采样或评测协议不得漏掉 exploration。
+Enhanced 存储格式
+已迁移 enhanced sample 的 canonical layout：
+
+enhanced_v1_split/<split>/<family>/<subtype-or-default>/tasks/<task>/<sample_id>/
+每条 sample 目录必须包含：
+
+data.hdf5
+action.npy
+instruction.json
+metadata.json
+scene_info.json
+video.mp4
+sample.json
+字段约定：
+
+文件	约定
+data.hdf5	主数据文件，包含 observation / action / state 等原始 payload
+action.npy	统一 action 数组；缺失源数据已补齐
+instruction.json	语言指令
+metadata.json	provenance 与样本元信息
+scene_info.json	场景信息；源数据缺失时用 {} 占位
+video.mp4	必须存在，按 semantic RGB 观看
+sample.json	canonical sample record，记录长度、shape、source path 等索引信息
+ActionFollowingData Euler/source root 与 ActionFollowingData_Rot6D root 共享上述 sample-directory layout。Rot6D root 的差异仅限 action/state 表示：
+
+action.npy 从 (T,14) 改为 (T,20)。
+data.hdf5/delta_ee_action/vector 从 (T,14) 改为 (T,20)。
+data.hdf5/delta_ee_state/vector 从 (T,14) 改为 (T,20)。
+HDF5 中 observation / RGB / pointcloud / joint_action / endpose 等非 action/state payload 通过 external links 指向 source root，不复制、不转码。
+video.mp4、instruction.json、scene_info.json 等非 action/state 文件通过 symlink 复用。
+RGB 约定
+本项目统一采用 semantic RGB：所有 loader / precompute / converter 对外输出的图像 tensor 都必须是 RGB 顺序。
+
+截至 2026-07-05，canonical enhanced split 已完成 RGB 统一：
+
+/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingData/enhanced_v1_split/{train,test,test_quick}
+正式规则：
+
+canonical enhanced data.hdf5 中训练会读到的 RGB bytes 已物理修复；当前 decode 结果按 semantic RGB 使用。
+canonical enhanced video.mp4 已按 semantic RGB 统一；perturbed 历史 stored video 已重编码。
+后续训练、评测、precompute、converter 读取 canonical enhanced data.hdf5 或 video.mp4 时，不得再默认执行 R/B swap。
+如果代码在 2026-07-05 之后对 canonical enhanced HDF5 再做 R/B swap，会重新引入颜色反转，视为 bug。
+Rot6D 派生 root 不改变 RGB 语义：ActionFollowingData_Rot6D 的 HDF5 observation/RGB 通过 external links 指向 canonical enhanced source，ActionFollowingData_LeRobot_Rot6D 复用 RGB-fixed LeRobot mirror 的非 action/state 资产。因此读取 Rot6D root 时也不得默认执行 R/B swap。
+本规则只覆盖 canonical ActionFollowingData/enhanced_v1_split；历史 source、旧备份、旧 LeRobot mirror、旧 latent/precompute、旧 sample video 和 raw ActionFollowingBench HDF5 需要单独审计或重建。
+读取策略：
+
+数据类	当前 canonical RGB 状态	读取约定
+expert clean	训练使用 clean LeRobot mp4；raw HDF5 不作为当前 RGB 入口	继续读 clean LeRobot mp4；不要直接用 raw HDF5 当 RGB
+perturbed	canonical HDF5 / video 均为 semantic RGB	不 swap
+random feasible	canonical HDF5 / video 均为 semantic RGB	不 swap
+counterfactual replay	canonical HDF5 / video 均为 semantic RGB	不 swap
+exploration	canonical HDF5 / video 为 semantic RGB	不 swap
+RGB 修复验收摘要：HDF5 physical repair 已覆盖 64/64 shards，manifest unique repair target 532,500 条全部完成；post-fix semantic preview 已由 human 确认颜色正确。详细证据路径见 docs/control.md 的 2026-07-05 - AFD HDF5 RGB physical repair accepted and documented。
+
+train/test/test_quick 协议
+具体 split 方案见：
+
+docs/tasks/action_following_data_split_plan.md
+当前 train/test/test_quick 协议已覆盖所有 enhanced 类别，包括 exploration。后续新增 enhanced 类别时，必须同步补齐 train/test/test_quick、summary、validation 和采样权重，不得在协议层面默认排除。
+
+目录结构：
+
+enhanced_v1_split/
+  train/
+  test/
+  test_quick/
+    backing_samples/
+    chunks/
+  manifests/
+约定：
+
+train/ 和 test/ 存 enhanced canonical sample dirs，按原始 sample 粒度划分；不是统一改造成 chunk record。
+exploration 属于 enhanced 正式类别；后续 split / quick test 统计必须把它纳入同一口径。
+perturbed sample 本身是 chunk-level；random feasible、counterfactual replay、exploration 是 trajectory-level。
+enhanced data 的目标 train/test = 1:1，按 source group 划分，避免同源泄漏。
+test_quick 从 test/ 中复制 backing sample dirs，不使用软链接。
+test_quick/chunks/ 用 jsonl 记录 chunk-level quick samples；默认 chunk size 为 32。
+默认训练使用 train/；默认测试使用 test_quick/；非特殊要求不用 full test/。
+ActionFollowingData_Rot6D/enhanced_v1_split 继承同一 split 协议与 manifest 语义；sample 数不变，只把 action/state 表示从 14D Euler 改为 20D Rot6D。
+source-group split unit：
+
+大类	split unit	test 划分
+perturbed	source expert episode / source chunk group	每 task 25/50 source episodes 入 test；pca/raw 同源 group 同 split
+random feasible	start-state / trajectory group	每 task/subtype 5/10 start groups 入 test；uniform/weighted 尽量共享 heldout starts
+counterfactual replay	source trajectory	每 task 10/20 source trajectories 入 test；同一 source 的 5 个 replay seeds 同 split
+exploration	policy rollout trajectory	每 task 5/10 rollout trajectories 入 test
+split 统计：
+
+大类	train samples	test samples
+perturbed	250,000	250,000
+random feasible	5,000	5,000
+counterfactual replay	2,500	2,500
+exploration	250	250
+合计	257,750	257,750
+test_quick 统计：
+
+大类	每 task quick chunk samples	50 tasks 总量
+perturbed	200	10,000
+random feasible	200	10,000
+counterfactual replay	200	10,000
+exploration	200	10,000
+合计	800	40,000
+子类分配：
+
+perturbed: 100 pca + 100 raw / task
+random feasible: 100 uniform + 100 weighted / task
+counterfactual replay: 200 / task
+exploration: 200 / task
+关键 manifest：
+
+文件	路径
+train samples	enhanced_v1_split/manifests/train_samples.jsonl
+test samples	enhanced_v1_split/manifests/test_samples.jsonl
+test_quick backing samples	enhanced_v1_split/manifests/test_quick_samples.jsonl
+test_quick chunks	enhanced_v1_split/manifests/test_quick_chunks.jsonl
+test final chunks c32	enhanced_v1_split/manifests/test_final_chunks_c32.jsonl
+split summary	enhanced_v1_split/manifests/split_summary.json
+validation summary	enhanced_v1_split/manifests/validation_summary.json
+sampling weight summary c32	enhanced_v1_split/manifests/sampling_weight_summary_c32.json
+sampling weight audit c32	enhanced_v1_split/manifests/sampling_weight_audit_c32_seed20260705.json
+采样口径
+本文只统计 sliding-window 采样，不统计 non-overlapping。
+
+定义：
+
+chunk16 samples = max(L - 16 + 1, 0)
+chunk32 samples = max(L - 32 + 1, 0)
+训练采样必须是 chunk sample level，不是 family-first 或 dataset-first。
+
+实现规则：
+
+clean / random feasible / counterfactual replay / exploration 是 trajectory-level，按 chunk size 做 stride-1 sliding windows。
+perturbed 是 chunk-level，训练时不继续 sliding；每条 33-step sample 只取一个前缀 chunk：chunk16 取前 16，chunk32 取前 32。
+必须先展开 effective chunk samples，再按每个 chunk sample 的 family weight 采样。
+禁止先按 family 概率选择大类，再在 family 内均匀选择 subtype / task / trajectory / window。
+任何训练脚本都必须在 preflight 中打印 effective chunk counts、effective per-chunk weights 和固定 seed sampler audit。
+给定当前 manifest 的 effective chunk 数 N_family，真实 sampled family probability 是：
+
+P(family) = N_family * w_family / Σ_i(N_i * w_i)
+若目标 sampled chunk count ratio 为 R_family，per-chunk implementation weight 为：
+
+w_family = (R_family / N_family) / (R_ref / N_ref)
+本文默认用 perturbed 归一化，因此 w_perturbed = 1。权重与 task set、split、filter、chunk size、perturbed no-sliding 规则绑定，不能跨任务集合无脑复用。
+
+训练 mix 协议
+mix_4to1to1to1to1
+用途：human 说 clean : enhanced = 1 : 1，且 enhanced 四类均分，包含 exploration。
+
+目标 sampled chunk ratio：
+
+clean : perturbed : random feasible : counterfactual replay : exploration = 4 : 1 : 1 : 1 : 1
+目标 sampled probability：
+
+clean 50%，perturbed / random feasible / counterfactual replay / exploration 各 12.5%
+当前四任务 test4v2、chunk32、train manifest：
+
+tasks = place_burger_fries, lift_pot, dump_bin_bigbin, rotate_qrcode
+N = clean 29,893 / perturbed 20,000 / random feasible 108,000 / counterfactual replay 30,095 / exploration 5,901
+weights = clean 2.676 / perturbed 1 / random feasible 0.185 / counterfactual replay 0.665 / exploration 3.389
+早期不含 exploration 的权重只对应旧统计，不适用于当前公约；所有新训练必须包含 exploration 并重新按当前 manifest 校准。
+
+mix_1to1to1to1to1
+用途：human 说 clean 和所有 enhanced 类别完全均分，包含 exploration。
+
+目标 sampled chunk ratio：
+
+clean : perturbed : random feasible : counterfactual replay : exploration = 1 : 1 : 1 : 1 : 1
+当前四任务 test4v2、chunk32、train manifest：
+
+weights = clean 0.669 / perturbed 1 / random feasible 0.185 / counterfactual replay 0.665 / exploration 3.389
+mix_enhanced_1to1to1to1
+用途：只混 enhanced，不混 clean；包含全部四类 enhanced。
+
+目标 sampled chunk ratio：
+
+perturbed : random feasible : counterfactual replay : exploration = 1 : 1 : 1 : 1
+当前四任务 test4v2、chunk32、train manifest：
+
+weights = perturbed 1 / random feasible 0.185 / counterfactual replay 0.665 / exploration 3.389
+全 50 任务 chunk32 train manifest 的权重已同步写入 sampling_weight_summary_c32.json。当前 full50 mix_4to1to1to1to1 权重为：
+
+clean 2.105 / perturbed 1 / random feasible 0.185 / counterfactual replay 0.533 / exploration 2.065
+sampler audit
+每个新增 loader / training script 必须至少抽样 10000 个样本做 preflight audit，记录：
+
+sample_count
+family_counts
+family_probabilities
+target_probabilities
+absolute_error
+pass/fail
+建议 pass 阈值：各 family probability 绝对误差 <= 2%。
+
+资产统计
+大类	子类 / asset	样本数	任务数	粒度	长度 min / median / mean / max	chunk16 sliding samples	chunk32 sliding samples
+expert clean	clean / demo_clean_zed2i_visible	2,500	50	trajectory	74 / 165 / 221.049 / 1411	515,122	475,122
+perturbed	pca / perturbed_pca_c8_sigma0p05_v1	250,000	50	chunk	33 / 33 / 33.000 / 33	4,500,000	500,000
+perturbed	raw / perturbed_raw_sigma0p0025_v1	250,000	50	chunk	33 / 33 / 33.000 / 33	4,500,000	500,000
+random feasible	uniform / random_feasible_300step_uniform_2ep5start_10seed_v1	5,000	50	trajectory	301 / 301 / 301.000 / 301	1,430,000	1,350,000
+random feasible	weighted / random_feasible_300step_weighted_2ep5start_10seed_v1	5,000	50	trajectory	301 / 301 / 301.000 / 301	1,430,000	1,350,000
+counterfactual replay	counterfactual_replay_50task_20src5seed_v1	5,000	50	trajectory	76 / 165.5 / 222.562 / 1357	1,037,810	957,810
+exploration	policy_rollout / exploration_policy_rollout_starvla_official48_step150000_50task10traj_v1	500	50	trajectory	52 / 401 / 511.688 / 1701	247,844	239,844
+按大类汇总：
+
+大类	样本数	粒度	chunk16 sliding samples	chunk32 sliding samples
+expert clean	2,500	trajectory level	515,122	475,122
+perturbed	500,000	chunk level	9,000,000	1,000,000
+random feasible	10,000	trajectory level	2,860,000	2,700,000
+counterfactual replay	5,000	trajectory level	1,037,810	957,810
+exploration	500	trajectory level	247,844	239,844
+当前已迁移 enhanced data 合计	515,500	mixed	13,145,654	4,897,654
+当前训练 mix 合计（expert clean + enhanced）	518,000	mixed	13,660,776	5,372,776
+starVLA LeRobot mirror
+当前 LeRobot source root，保留为 Euler/source 14D：
+
+/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingData_LeRobot
+当前 LeRobot Rot6D root，后续新训练默认优先使用：
+
+/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingData_LeRobot_Rot6D
+三视角 schema：
+
+cam_high / cam_left_wrist / cam_right_wrist
+LeRobot language metadata 公约：
+
+自 2026-07-07 起，AFD 两份 LeRobot root 的 language metadata 统一使用 RoboTwin description/task_instruction/<task>.json 中的 full_description。
+每个 task dataset 的 meta/tasks.parquet 只保留一条 instruction，index 为 full_description，task_index=0。
+每个 task dataset 的 meta/episodes/chunk-000/file-000.parquet 中所有 episode 的 tasks 均为 [full_description]。
+每个 task dataset 的 data/*.parquet 中逐帧 task_index 均为 0，meta/info.json.total_tasks=1。
+这条规则是为了让 clean / perturbed / random feasible / counterfactual replay / exploration 在训练 text conditioning 上完全对齐；旧 per-episode generated prompt 和 counterfactual task-name fallback 不再作为 LeRobot 默认语言入口。
+当前 LeRobot source root summary：
+
+{
+  "datasets": 350,
+  "episodes": 260250,
+  "frames": 10982898,
+  "steps": 2190026
+}
+当前 LeRobot Rot6D root summary：
+
+{
+  "datasets": 350,
+  "frames": 10982898,
+  "data_parquet_files": 350,
+  "action_shape": [20],
+  "state_shape": [20],
+  "family_dataset_counts": {
+    "clean": 50,
+    "perturbed": 100,
+    "random_feasible": 100,
+    "counterfactual_replay": 50,
+    "exploration": 50
+  }
+}
+注意：2026-07-05 HDF5 RGB physical repair 不会自动修改修复前已经生成的旧 LeRobot mirror / visual cache / precompute latent。如果训练要依赖任何旧派生产物，必须确认其生成时间，或重建 / 重新做 RGB preview。当前默认 LeRobot 训练入口应使用 /mnt/dataset/csx_workspace/Ideas/data/ActionFollowingData_LeRobot_Rot6D，并把 action/state dim 设置为 20。
+
+校验与 provenance
+项目	结果
+enhanced migration summary	/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingData/migration_summary.json
+enhanced validation summary	/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingData/validation_summary.json
+enhanced split summary	/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingData/enhanced_v1_split/manifests/split_summary.json
+enhanced split validation	/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingData/enhanced_v1_split/manifests/validation_summary.json
+starVLA LeRobot mirror summary	/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingData_LeRobot/conversion_summary.json
+starVLA LeRobot conversion script	tools/convert_actionfollowing_to_lerobot.py
+starVLA LeRobot full-description language repair script	tools/repair_lerobot_language_to_fulldescription.py
+starVLA LeRobot full-description language validation	/mnt/dataset/public_data/cscsx_projects/AF3/logs/afd_lerobot_fulldesc_repair_20260707/validate_full_summary.json
+starVLA LeRobot Rot6D summary	/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingData_LeRobot_Rot6D/rot6d_conversion_summary.json
+starVLA LeRobot Rot6D validation	/mnt/dataset/public_data/cscsx_projects/AF3/logs/afd_lerobot_rot6d_20260707/ACWM_afd_lerobot_rot6d_cpu_finalize_local_20260707/validation_summary.json
+starVLA LeRobot Rot6D conversion script	tools/convert_lerobot_action_state_to_rot6d.py
+original ActionFollowingData Rot6D summary	/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingData_Rot6D/rot6d_conversion_summary.json
+original ActionFollowingData Rot6D validation	/mnt/dataset/public_data/cscsx_projects/AF3/logs/afd_raw_rot6d_20260707/ACWM_afd_raw_rot6d_cpu_finalize_local_20260707/validation_summary.json
+original ActionFollowingData Rot6D conversion script	tools/convert_actionfollowing_raw_to_rot6d.py
+expert randomized 500 Rot6D LeRobot rebuild validation	/mnt/dataset/public_data/cscsx_projects/AF3/logs/afd_randomized500_lerobot_rot6d_rebuild_20260709_034212/formal_validation_summary.json
+expert randomized 500 Rot6D LeRobot H.264 ffprobe validation	/mnt/dataset/public_data/cscsx_projects/AF3/logs/afd_randomized500_rot6d_av1_to_h264_20260709/final_ffprobe_validation_summary.txt
+expert randomized 500 Rot6D LeRobot decord validation	/mnt/dataset/public_data/cscsx_projects/AF3/logs/afd_randomized500_rot6d_av1_to_h264_20260709/final_decord_validation_summary.txt
+policy rollout validation	/mnt/dataset/csx_workspace/Ideas/data/ActionFollowingData/datasets/exploration_policy_rollout_starvla_official48_step150000_50task10traj_v1/validation_summary.json
+有效校验摘要：
+
+original three-family enhanced migration validation：checked_samples=515000，failed_samples=0。
+exploration policy rollout validation：checked_samples=500，failed_samples=0。
+enhanced split validation：checked_train_samples=257750，checked_test_samples=257750，checked_quick_backing_samples=17750，checked_quick_chunks=40000，validation failed=0。
+sampling weight audit：sampling_weight_audit_c32_seed20260705.json 使用固定 seed 20260705 抽样 100000 次，验证 mix_4to1to1to1to1、mix_1to1to1to1to1、mix_enhanced_1to1to1to1 均为 chunk-sample level 采样概率，非 family-first。
+expert clean metadata check：50 个 task 的 steps_data_index.pkl step 数与 meta/info.json.total_frames 对齐。
+policy rollout unified asset validation：checked_samples=500，failed_samples=0，task_count=50，per_task_count=10。
+LeRobot Rot6D validation：datasets=350，frames=10982898，action_shape=[20]，state_shape=[20]，family dataset counts 为 clean 50 / perturbed 100 / random_feasible 100 / counterfactual_replay 50 / exploration 50，bad_count=0。
+original ActionFollowingData Rot6D validation：expected_samples=533250，converted_samples=533250，failed_samples=0，action_shape=[20]，state_shape=[20]，split counts train 257750 / test 257750 / test_quick 17750，bad_count=0。
+LeRobot full-description language validation：两份 root 合计 datasets=700，episodes=520500，frames=21965796，old_task_rows=700，validation_error_count=0。按 root/family 审计，14D 与 Rot6D 两份 root 的 clean 50、perturbed 100、random feasible 100、counterfactual replay 50、exploration 50 个 task dataset 均为 full_description，bad=0。
+expert randomized 500 Rot6D LeRobot H.264 repair validation：正式 root 596/596 mp4 为 h264/yuv420p，无 symlink；逐文件与 14D source LeRobot 的 nb_frames/width/height/avg_frame_rate/r_frame_rate 一致，bad_count=0；starVLA venv decord 0.6.0 全量打开并读取首/中/尾帧，ok_count=596、bad_count=0、zero_len_count=0。

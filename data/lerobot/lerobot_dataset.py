@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import torch.utils.data as data
 import warnings
+from datasets import load_dataset
 
 try:
     from transformers import AutoProcessor  # type: ignore
@@ -26,14 +27,213 @@ except Exception:  # pragma: no cover
 from utils.vlm_utils import preprocess_vlm_messages
 
 from data.utils.image_utils import resize_with_padding, tensor_to_pil
-from data.utils.norm import normalize_actions, load_normalization_stats
+from data.utils.norm import normalize_actions, load_action_state_normalization_stats
 
-from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata, MultiLeRobotDataset
+from lerobot.datasets.lerobot_dataset import (
+    LeRobotDataset,
+    LeRobotDatasetMetadata,
+    MultiLeRobotDataset,
+    hf_transform_to_torch,
+)
 from lerobot.datasets.video_utils import decode_video_frames
 
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*multichannel.*")
 
 logger = logging.getLogger(__name__)
+
+
+class _LocalV3Metadata:
+    """Small local-only metadata reader for LeRobot v3 parquet metadata."""
+
+    def __init__(self, root: str | Path):
+        self.root = Path(root)
+        with open(self.root / "meta" / "info.json", "r", encoding="utf-8") as f:
+            self.info = json.load(f)
+
+        self.features = self.info["features"]
+        self.tasks, self.task_to_task_index = self._load_tasks()
+        self.episodes = self._load_episodes()
+        self._episodes_by_index = {
+            int(ep["episode_index"]): ep for ep in self.episodes.values()
+        }
+
+    def _load_tasks(self) -> Tuple[Dict[int, str], Dict[str, int]]:
+        tasks_path = self.root / "meta" / "tasks.parquet"
+        if not tasks_path.is_file():
+            return {}, {}
+
+        import pyarrow.parquet as pq
+
+        table = pq.read_table(tasks_path)
+        data = table.to_pydict()
+        task_indices = data.get("task_index", [])
+        text_col = "task" if "task" in data else "__index_level_0__"
+        texts = data.get(text_col, [])
+        tasks = {int(i): str(t) for i, t in zip(task_indices, texts)}
+        return tasks, {task: idx for idx, task in tasks.items()}
+
+    def _load_episodes(self) -> Dict[int, Dict[str, Any]]:
+        import pyarrow.parquet as pq
+
+        files = sorted((self.root / "meta" / "episodes").glob("**/*.parquet"))
+        if not files:
+            raise FileNotFoundError(f"No v3 episode parquet files found under {self.root / 'meta' / 'episodes'}")
+
+        episodes: Dict[int, Dict[str, Any]] = {}
+        for file_path in files:
+            table = pq.read_table(file_path)
+            rows = table.to_pylist()
+            for row in rows:
+                ep_index = int(row["episode_index"])
+                episodes[ep_index] = row
+        return episodes
+
+    @property
+    def video_keys(self) -> List[str]:
+        return [key for key, ft in self.features.items() if ft.get("dtype") == "video"]
+
+    @property
+    def camera_keys(self) -> List[str]:
+        return [key for key, ft in self.features.items() if ft.get("dtype") in ["video", "image"]]
+
+    @property
+    def total_episodes(self) -> int:
+        return int(self.info["total_episodes"])
+
+    @property
+    def total_frames(self) -> int:
+        return int(self.info["total_frames"])
+
+    @property
+    def fps(self) -> int:
+        return int(self.info["fps"])
+
+    def get_video_file_path(self, ep_index: int, vid_key: str) -> Path:
+        ep = self._episodes_by_index[int(ep_index)]
+        chunk = int(ep.get(f"videos/{vid_key}/chunk_index", ep.get("data/chunk_index", 0)))
+        file_idx = int(ep.get(f"videos/{vid_key}/file_index", ep.get("data/file_index", int(ep_index))))
+        rel = self.info["video_path"].format(
+            video_key=vid_key,
+            chunk_index=chunk,
+            file_index=file_idx,
+            episode_chunk=chunk,
+            episode_index=int(ep_index),
+        )
+        return Path(rel)
+
+    def get_episode_task(self, ep_index: int) -> str:
+        ep = self._episodes_by_index[int(ep_index)]
+        tasks = ep.get("tasks", None)
+        if isinstance(tasks, (list, tuple)) and tasks:
+            return str(tasks[0])
+        task_index = ep.get("task_index", 0)
+        try:
+            return self.tasks[int(task_index)]
+        except Exception:
+            return str(task_index)
+
+
+class _LocalV3LeRobotDataset:
+    """Local-only subset of LeRobotDataset used by Motus for v3 parquet datasets."""
+
+    def __init__(
+        self,
+        repo_id: str,
+        root: str | Path,
+        episodes: Optional[List[int]] = None,
+        video_backend: Optional[str] = None,
+    ):
+        self.repo_id = repo_id
+        self.root = Path(root)
+        self.episodes = episodes
+        self.meta = _LocalV3Metadata(self.root)
+        self.features = self.meta.features
+        self.tolerance_s = 0.0001
+        self.video_backend = video_backend or "pyav"
+
+        selected = list(episodes) if episodes is not None else sorted(self.meta.episodes.keys())
+        selected_set = set(int(ep) for ep in selected)
+        self._selected_episodes = selected
+        self._episode_rows = [self.meta.episodes[int(ep)] for ep in selected]
+
+        data_files = sorted(str(p) for p in (self.root / "data").glob("**/*.parquet"))
+        if not data_files:
+            raise FileNotFoundError(f"No data parquet files found under {self.root / 'data'}")
+        datasets_cache_dir = os.environ.get(
+            "HF_DATASETS_CACHE",
+            "/mnt/gyc/wth-Motus/.cache/hf_datasets",
+        )
+        self.hf_dataset = load_dataset(
+            "parquet",
+            data_files=data_files,
+            split="train",
+            cache_dir=datasets_cache_dir,
+        )
+        if episodes is not None:
+            self.hf_dataset = self.hf_dataset.filter(
+                lambda ep: int(ep) in selected_set,
+                input_columns="episode_index",
+                load_from_cache_file=False,
+            )
+        self.hf_dataset.set_transform(hf_transform_to_torch)
+
+        if episodes is not None:
+            from_indices = []
+            to_indices = []
+            cursor = 0
+            for row in self._episode_rows:
+                length = int(row.get("length", int(row["dataset_to_index"]) - int(row["dataset_from_index"])))
+                from_indices.append(cursor)
+                cursor += length
+                to_indices.append(cursor)
+        else:
+            from_indices = [int(row["dataset_from_index"]) for row in self._episode_rows]
+            to_indices = [int(row["dataset_to_index"]) for row in self._episode_rows]
+
+        self.episode_data_index = {
+            "from": torch.tensor(from_indices, dtype=torch.long),
+            "to": torch.tensor(to_indices, dtype=torch.long),
+        }
+        self.num_episodes = len(self._episode_rows)
+        self.num_frames = len(self.hf_dataset)
+
+
+class _LocalV3MultiLeRobotDataset:
+    def __init__(
+        self,
+        repo_ids: List[str],
+        root: str | Path,
+        episodes: Optional[Dict[str, List[int]]] = None,
+        video_backend: Optional[str] = None,
+    ):
+        self.repo_ids = repo_ids
+        self.root = Path(root)
+        self._datasets = [
+            _LocalV3LeRobotDataset(
+                repo_id=repo_id,
+                root=self.root / repo_id,
+                episodes=episodes[repo_id] if episodes else None,
+                video_backend=video_backend,
+            )
+            for repo_id in repo_ids
+        ]
+        self.num_frames = sum(ds.num_frames for ds in self._datasets)
+        self.num_episodes = sum(ds.num_episodes for ds in self._datasets)
+
+
+def _is_local_v3_lerobot_root(root: Optional[str | Path]) -> bool:
+    if root is None:
+        return False
+    root_path = Path(root)
+    return (
+        (root_path / "meta" / "info.json").is_file()
+        and (root_path / "meta" / "episodes").is_dir()
+    )
+
+
+def _read_local_total_episodes(root: str | Path) -> int:
+    with open(Path(root) / "meta" / "info.json", "r", encoding="utf-8") as f:
+        return int(json.load(f)["total_episodes"])
 
 
 class LeRobotMotusDataset(data.Dataset):
@@ -147,6 +347,10 @@ class LeRobotMotusDataset(data.Dataset):
         video_backend: Optional[str] = None,
 
         embodiment_type: str = "aloha_agilex_2", # for loading normalization statistics
+        normalization_stats_path: Optional[str] = None,
+        normalization_dataset_key: Optional[str] = None,
+        normalize_action_state: bool = True,
+        sampling_groups: Optional[List[Dict[str, Any]]] = None,
         task_mode: str = "single", # "single" or "multi"
         task_name: str = "null",
         **kwargs
@@ -183,6 +387,13 @@ class LeRobotMotusDataset(data.Dataset):
         self.image_aug = image_aug # No extra augmentation on LeRobot side for now
         self.task_mode = task_mode
         self.task_name = task_name
+        self.normalize_action_state = bool(normalize_action_state)
+        self.normalization_dataset_key = normalization_dataset_key or embodiment_type
+        self.sampling_groups = sampling_groups or None
+        self.sampling_group_specs: List[Dict[str, Any]] = []
+        self.sampling_group_dataset_indices: List[List[int]] = []
+        self.sampling_group_episode_counts: List[int] = []
+        self.sampling_group_weights: List[float] = []
         
         # ---- T5 fallback config (lazy init) ----
         self.enable_t5_fallback = bool(enable_t5_fallback)
@@ -209,8 +420,11 @@ class LeRobotMotusDataset(data.Dataset):
         # ---- Select episode subset (optional) ----
         # Read-only metadata to get total_episodes, avoiding parquet reads while conversion is ongoing.
         if self.task_mode == "single":
-            meta = LeRobotDatasetMetadata(self.repo_id, root=self.root)
-            total_eps = int(meta.total_episodes)
+            if _is_local_v3_lerobot_root(self.root):
+                total_eps = _read_local_total_episodes(self.root)
+            else:
+                meta = LeRobotDatasetMetadata(self.repo_id, root=self.root)
+                total_eps = int(meta.total_episodes)
             
             all_ep_ids = list(range(total_eps))
             rng = random.Random(0)
@@ -221,7 +435,11 @@ class LeRobotMotusDataset(data.Dataset):
 
             self.episode_ids = all_ep_ids
         elif self.task_mode == "multi":
-            if self.task_name == None:
+            if self.sampling_groups:
+                if self.root is None:
+                    raise ValueError("sampling_groups requires a local root path")
+                self.repo_ids, self.sampling_group_specs = self._build_sampling_groups(self.sampling_groups)
+            elif self.task_name == None:
                 self.repo_ids = [task_name for task_name in os.listdir(self.root) if os.path.isdir(os.path.join(self.root, task_name))]
             elif isinstance(self.task_name, list):
                 self.repo_ids = self.task_name
@@ -234,8 +452,7 @@ class LeRobotMotusDataset(data.Dataset):
                 self.repo_ids = [self.task_name]
             else:
                 raise ValueError(f"Invalid task name: {self.task_name}")
-            metas = [LeRobotDatasetMetadata(task_name, root=os.path.join(self.root, task_name)) for task_name in self.repo_ids]
-            self.episode_ids = {task_name: list(range(int(meta.total_episodes))) for task_name, meta in zip(self.repo_ids, metas)}
+            self.repo_ids, self.episode_ids = self._build_multi_episode_ids(self.repo_ids)
 
         
         
@@ -244,18 +461,21 @@ class LeRobotMotusDataset(data.Dataset):
         resolved_video_backend = video_backend if video_backend is not None else "pyav"
         logger.info(f"Using video backend: {resolved_video_backend} (pyav is more memory efficient)")
         if self.task_mode == "single":
-            self.lerobot_dataset = LeRobotDataset(
-                repo_id=self.repo_id, 
-                root=self.root, 
-                episodes=self.episode_ids,
-                video_backend=resolved_video_backend
-            )
-        elif self.task_mode == "multi":
-            self.lerobot_dataset = MultiLeRobotDataset(
-                repo_ids=self.repo_ids, 
+            dataset_cls = _LocalV3LeRobotDataset if _is_local_v3_lerobot_root(self.root) else LeRobotDataset
+            self.lerobot_dataset = dataset_cls(
+                repo_id=self.repo_id,
                 root=self.root,
                 episodes=self.episode_ids,
-                video_backend=resolved_video_backend
+                video_backend=resolved_video_backend,
+            )
+        elif self.task_mode == "multi":
+            use_local_v3 = all(_is_local_v3_lerobot_root(Path(self.root) / repo_id) for repo_id in self.repo_ids)
+            multi_dataset_cls = _LocalV3MultiLeRobotDataset if use_local_v3 else MultiLeRobotDataset
+            self.lerobot_dataset = multi_dataset_cls(
+                repo_ids=self.repo_ids,
+                root=self.root,
+                episodes=self.episode_ids,
+                video_backend=resolved_video_backend,
             )
             self.episode_id_to_task_idx = []
             self.episode_num_accumulated = []
@@ -269,6 +489,17 @@ class LeRobotMotusDataset(data.Dataset):
                 
                 tmp_frame_cnt += int(self.lerobot_dataset._datasets[idx].num_frames)
                 self.frame_num_accumulated.append(tmp_frame_cnt)
+            if self.sampling_group_specs:
+                dataset_cursor = 0
+                for group_spec in self.sampling_group_specs:
+                    dataset_indices = list(range(dataset_cursor, dataset_cursor + len(group_spec["repo_ids"])))
+                    dataset_cursor += len(group_spec["repo_ids"])
+                    episode_count = sum(len(self.episode_ids[self.repo_ids[idx]]) for idx in dataset_indices)
+                    if episode_count <= 0:
+                        raise ValueError(f"Sampling group '{group_spec['name']}' contains no episodes")
+                    self.sampling_group_dataset_indices.append(dataset_indices)
+                    self.sampling_group_episode_counts.append(episode_count)
+                    self.sampling_group_weights.append(float(group_spec["weight"]))
 
         # Episode-level embedding cache (for external t5 embedding files referenced from meta/episodes.jsonl)
         # key: global episode_index (int) ; value: torch.Tensor
@@ -321,18 +552,169 @@ class LeRobotMotusDataset(data.Dataset):
         
         # Load normalization statistics
         current_dir = Path(__file__).parent.parent  # Go up to data directory
-        stat_path = current_dir / "utils" / "stat.json"
-        self.action_min, self.action_max = load_normalization_stats(str(stat_path), embodiment_type)
+        stat_path = Path(normalization_stats_path) if normalization_stats_path else (current_dir / "utils" / "stat.json")
+        (
+            self.action_min,
+            self.action_max,
+            self.state_min,
+            self.state_max,
+        ) = load_action_state_normalization_stats(str(stat_path), self.normalization_dataset_key)
 
         logger.info(f"LeRobot dataset initialized: repo_id={self.repo_id}, root={self.root}")
         logger.info(f"Embodiment type: {embodiment_type} (for normalization statistics)")
+        logger.info(f"Normalization enabled: {self.normalize_action_state}")
+        logger.info(f"Normalization stats path: {stat_path}")
+        logger.info(f"Normalization dataset key: {self.normalization_dataset_key}")
         logger.info(f"Image source: {'concatenated' if self.has_concat else ('three_cam' if self.has_three_cam else 'single_view')}")
         if self.task_mode == "single":
             logger.info(f"Selected episodes: {len(self.episode_ids)}/{total_eps}")
         elif self.task_mode == "multi":
             total_selected = sum(len(ep_ids) for ep_ids in self.episode_ids.values())
             logger.info(f"Selected episodes: {total_selected} (across {len(self.repo_ids)} repos)")
+            if self.sampling_group_specs:
+                for spec, indices, episode_count in zip(
+                    self.sampling_group_specs,
+                    self.sampling_group_dataset_indices,
+                    self.sampling_group_episode_counts,
+                ):
+                    logger.info(
+                        f"Sampling group '{spec['name']}': weight={spec['weight']}, "
+                        f"repos={len(indices)}, episodes={episode_count}"
+                    )
         logger.info(f"Video size: {self.video_size}, Frames: {self.num_video_frames}")
+
+    def _normalize_repo_id(self, repo_id: str) -> str:
+        repo_path = Path(str(repo_id))
+        if repo_path.is_absolute():
+            if self.root is None:
+                raise ValueError(f"Cannot normalize absolute repo path without root: {repo_id}")
+            repo_path = repo_path.resolve()
+            root_path = Path(self.root).resolve()
+            try:
+                repo_path = repo_path.relative_to(root_path)
+            except ValueError as exc:
+                raise ValueError(f"Repo path {repo_id} must be under root {self.root}") from exc
+        return str(repo_path).strip("/")
+
+    def _discover_repo_ids_under(self, root_spec: str) -> List[str]:
+        if self.root is None:
+            raise ValueError("Cannot discover repo ids without a local root")
+        search_root = Path(root_spec)
+        if not search_root.is_absolute():
+            search_root = Path(self.root) / search_root
+        search_root = search_root.resolve()
+
+        if (search_root / "meta" / "info.json").is_file():
+            return [self._normalize_repo_id(str(search_root))]
+
+        if (search_root / "tasks").is_dir() and not (search_root / "meta" / "info.json").is_file():
+            search_root = (search_root / "tasks").resolve()
+
+        repo_ids = []
+        for child in sorted(search_root.iterdir()):
+            if child.is_dir() and (child / "meta" / "info.json").is_file():
+                repo_ids.append(self._normalize_repo_id(str(child)))
+
+        if not repo_ids:
+            raise ValueError(f"No LeRobot task datasets found under {search_root}")
+        return repo_ids
+
+    def _build_sampling_groups(self, sampling_groups: List[Dict[str, Any]]) -> Tuple[List[str], List[Dict[str, Any]]]:
+        if self.task_mode != "multi":
+            raise ValueError("sampling_groups is only supported in task_mode='multi'")
+
+        flat_repo_ids: List[str] = []
+        group_specs: List[Dict[str, Any]] = []
+
+        for group_idx, group in enumerate(sampling_groups):
+            group_name = str(group.get("name", f"group_{group_idx}"))
+            group_weight = float(group.get("weight", 1.0))
+            if group_weight <= 0:
+                raise ValueError(f"sampling_groups[{group_idx}] has non-positive weight: {group_weight}")
+
+            if group.get("repo_ids") is not None:
+                group_repo_ids = [self._normalize_repo_id(repo_id) for repo_id in group["repo_ids"]]
+            else:
+                group_roots = group.get("roots")
+                if group_roots is None:
+                    group_root = group.get("root")
+                    if group_root is None:
+                        raise ValueError(
+                            f"sampling_groups[{group_idx}] must provide one of repo_ids / root / roots"
+                        )
+                    group_roots = [group_root]
+                elif isinstance(group_roots, str):
+                    group_roots = [group_roots]
+
+                group_repo_ids = []
+                for root_spec in group_roots:
+                    group_repo_ids.extend(self._discover_repo_ids_under(str(root_spec)))
+
+            if not group_repo_ids:
+                raise ValueError(f"sampling_groups[{group_idx}] resolved to zero task datasets")
+
+            flat_repo_ids.extend(group_repo_ids)
+            group_specs.append(
+                {
+                    "name": group_name,
+                    "weight": group_weight,
+                    "repo_ids": group_repo_ids,
+                }
+            )
+
+        return flat_repo_ids, group_specs
+
+    def _build_multi_episode_ids(self, repo_ids: List[str]) -> Tuple[List[str], Dict[str, List[int]]]:
+        metas = []
+        for task_name in repo_ids:
+            task_root = os.path.join(self.root, task_name)
+            if _is_local_v3_lerobot_root(task_root):
+                metas.append({"total_episodes": _read_local_total_episodes(task_root)})
+            else:
+                metas.append(LeRobotDatasetMetadata(task_name, root=task_root))
+        all_episode_ids = {
+            task_name: list(range(int(meta["total_episodes"] if isinstance(meta, dict) else meta.total_episodes)))
+            for task_name, meta in zip(repo_ids, metas)
+        }
+
+        if self.max_episodes is None or self.max_episodes <= 0:
+            return repo_ids, all_episode_ids
+
+        rng = random.Random(0)
+        shuffled_episode_ids = {}
+        selected_episode_ids = {task_name: [] for task_name in repo_ids}
+        active_repo_ids = []
+        for task_name, episode_ids in all_episode_ids.items():
+            shuffled = list(episode_ids)
+            rng.shuffle(shuffled)
+            shuffled_episode_ids[task_name] = shuffled
+            if shuffled:
+                active_repo_ids.append(task_name)
+
+        total_selected = 0
+        while total_selected < self.max_episodes and active_repo_ids:
+            next_active_repo_ids = []
+            for task_name in active_repo_ids:
+                remaining = shuffled_episode_ids[task_name]
+                if not remaining:
+                    continue
+                selected_episode_ids[task_name].append(remaining.pop())
+                total_selected += 1
+                if remaining:
+                    next_active_repo_ids.append(task_name)
+                if total_selected >= self.max_episodes:
+                    break
+            active_repo_ids = next_active_repo_ids
+
+        filtered_repo_ids = []
+        filtered_episode_ids = {}
+        for task_name in repo_ids:
+            episode_ids = selected_episode_ids[task_name]
+            if episode_ids:
+                filtered_repo_ids.append(task_name)
+                filtered_episode_ids[task_name] = sorted(episode_ids)
+
+        return filtered_repo_ids, filtered_episode_ids
 
     def _episodes_jsonl_path(self) -> Path:
         if self.lerobot_dataset is None:
@@ -512,6 +894,28 @@ class LeRobotMotusDataset(data.Dataset):
     def __len__(self):
         """Return number of episodes."""
         return self.lerobot_dataset.num_episodes * 1000
+
+    def _sample_multi_task_episode(self) -> Tuple[int, int]:
+        if self.sampling_group_specs:
+            group_idx = random.choices(
+                population=list(range(len(self.sampling_group_weights))),
+                weights=self.sampling_group_weights,
+                k=1,
+            )[0]
+            dataset_indices = self.sampling_group_dataset_indices[group_idx]
+            target_offset = random.randint(0, self.sampling_group_episode_counts[group_idx] - 1)
+            for task_idx in dataset_indices:
+                task_episode_count = len(self.episode_ids[self.repo_ids[task_idx]])
+                if target_offset < task_episode_count:
+                    return task_idx, target_offset
+                target_offset -= task_episode_count
+            raise RuntimeError(f"Failed to sample episode from group {self.sampling_group_specs[group_idx]['name']}")
+
+        episode_idx = random.randint(0, self.lerobot_dataset.num_episodes - 1)
+        task_idx = self.episode_id_to_task_idx[episode_idx]
+        if task_idx > 0:
+            episode_idx = episode_idx - self.episode_num_accumulated[task_idx - 1]
+        return task_idx, episode_idx
     
     def __getitem__(self, idx):
         """
@@ -526,14 +930,12 @@ class LeRobotMotusDataset(data.Dataset):
         if not self.lerobot_dataset:
             return None
 
-        episode_idx = random.randint(0, self.lerobot_dataset.num_episodes - 1)
         if self.task_mode == "multi":
-            task_idx = self.episode_id_to_task_idx[episode_idx]
-            if task_idx > 0:
-                episode_idx = episode_idx - self.episode_num_accumulated[task_idx - 1]
+            task_idx, episode_idx = self._sample_multi_task_episode()
             from_idx_t = self.lerobot_dataset._datasets[task_idx].episode_data_index["from"][episode_idx]
             to_idx_t = self.lerobot_dataset._datasets[task_idx].episode_data_index["to"][episode_idx]
         else:
+            episode_idx = random.randint(0, self.lerobot_dataset.num_episodes - 1)
             from_idx_t = self.lerobot_dataset.episode_data_index["from"][episode_idx]
             to_idx_t = self.lerobot_dataset.episode_data_index["to"][episode_idx]
         
@@ -733,10 +1135,8 @@ class LeRobotMotusDataset(data.Dataset):
 
             cached = self._episode_embedding_cache.get(ep_index, None)
             if cached is None:
-                if self.task_mode == 'single':
-                    ep_meta = self.lerobot_dataset.meta.episodes.get(ep_index, None)
-                else:
-                    ep_meta = self.lerobot_dataset._datasets[task_idx].meta.episodes.get(ep_index, None)
+                ds_for_embedding = self.lerobot_dataset if self.task_mode == 'single' else self.lerobot_dataset._datasets[task_idx]
+                ep_meta = ds_for_embedding.meta.episodes.get(ep_index, None)
                 if ep_meta is None:
                     raise KeyError(f"episode {ep_index} not found in meta.episodes")
 
@@ -752,6 +1152,8 @@ class LeRobotMotusDataset(data.Dataset):
                     instr = item_cond.get("language_instruction", None)
                     if instr is None or (isinstance(instr, str) and len(instr.strip()) == 0):
                         instr = item_cond.get("task", "")
+                    if (instr is None or (isinstance(instr, str) and len(instr.strip()) == 0)) and hasattr(ds_for_embedding.meta, "get_episode_task"):
+                        instr = ds_for_embedding.meta.get_episode_task(ep_index)
                     if not isinstance(instr, str):
                         instr = str(instr)
                     emb = self._encode_and_cache_t5_embedding(ep_index, instr)
@@ -793,8 +1195,12 @@ class LeRobotMotusDataset(data.Dataset):
             first_frame_pil = tensor_to_pil(first_frame)
             vlm_tokens = preprocess_vlm_messages(text_instr, first_frame_pil, self.vlm_processor)
 
-        normalized_actions = normalize_actions(action_sequence, self.action_min, self.action_max)
-        normalized_initial_state = normalize_actions(initial_state.unsqueeze(0), self.action_min, self.action_max).squeeze(0)
+        if self.normalize_action_state:
+            normalized_actions = normalize_actions(action_sequence, self.action_min, self.action_max)
+            normalized_initial_state = normalize_actions(initial_state.unsqueeze(0), self.state_min, self.state_max).squeeze(0)
+        else:
+            normalized_actions = action_sequence.float()
+            normalized_initial_state = initial_state.float()
 
         return {
             'first_frame': first_frame,

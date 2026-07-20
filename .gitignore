@@ -224,9 +224,11 @@ marimo/_lsp/
 __marimo__/
 
 checkpoints/*
+checkpoints_smoke/
 wandb/*
 logs/*
 datasets/*
+pretrained_models/
 
 scripts_new/
 scripts/run_local.sh

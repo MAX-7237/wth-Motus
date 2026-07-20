@@ -4,8 +4,8 @@
 # ============================================================================
 # Single Task Configuration - MODIFY THESE
 # ============================================================================
-TASK_NAME="click_alarmclock"  # Change this to the task you want to test
-GPU_ID=0                       # GPU to use
+TASK_NAME="${1:-click_alarmclock}"  # Change this to the task you want to test
+GPU_ID="${2:-0}"                    # GPU to use
 
 # ============================================================================
 # Script starts here
@@ -44,6 +44,8 @@ SEED=$(grep "^seed:" "$CONFIG_FILE" | sed 's/#.*//' | sed 's/.*: *"\?\([^"]*\)"\
 TASK_CONFIG=${TASK_CONFIG:-"demo_randomized"}
 SEED=${SEED:-"42"}
 POLICY_NAME="Motus"
+RENDER_LIBS_ROOT="${RENDER_LIBS_ROOT:-/mnt/gyc/render_libs}"
+NVIDIA_LIBS_ROOT="${NVIDIA_LIBS_ROOT:-/mnt/gyc/nvidia-libs}"
 
 # ============================================================================
 # Validation
@@ -113,6 +115,54 @@ fi
 export PYTHONPATH="${ROBOTWIN_ROOT}:${PYTHONPATH}"
 export OMP_NUM_THREADS=8
 export CUDA_VISIBLE_DEVICES=$GPU_ID
+ROBOTWIN_ENV_ROOT="$(dirname "$(dirname "$CONDA_ENV")")"
+ROBOTWIN_OPEN3D_LIB_ROOT="${ROBOTWIN_ENV_ROOT}/lib/python3.10/site-packages/open3d"
+export PATH="${RENDER_LIBS_ROOT}/bin:${PATH}"
+export LD_LIBRARY_PATH="${RENDER_LIBS_ROOT}:${ROBOTWIN_OPEN3D_LIB_ROOT}:/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:${NVIDIA_LIBS_ROOT}:${LD_LIBRARY_PATH:-}"
+export VK_ICD_FILENAMES="${VK_ICD_FILENAMES:-${NVIDIA_LIBS_ROOT}/nvidia_egl_icd.json}"
+
+strip_nvidia_ml_from_ld_preload() {
+    local value="${LD_PRELOAD:-}"
+    local cleaned=()
+    local entry base
+
+    [[ -n "$value" ]] || return 0
+    IFS=':' read -r -a _preload_entries <<< "$value"
+    for entry in "${_preload_entries[@]}"; do
+        [[ -n "$entry" ]] || continue
+        base="$(basename "$entry")"
+        if [[ "$base" == libnvidia-ml.so* ]]; then
+            continue
+        fi
+        cleaned+=("$entry")
+    done
+
+    if (( ${#cleaned[@]} == 0 )); then
+        unset LD_PRELOAD
+    else
+        local IFS=':'
+        export LD_PRELOAD="${cleaned[*]}"
+    fi
+}
+
+strip_nvidia_ml_from_ld_preload
+
+if [ -z "${LIBGL_SO_PATH:-}" ]; then
+    for candidate in \
+        "${RENDER_LIBS_ROOT}/libGL.so.1" \
+        "${ROBOTWIN_OPEN3D_LIB_ROOT}/libGL.so.1" \
+        /usr/lib/x86_64-linux-gnu/libGL.so.1 \
+        /lib/x86_64-linux-gnu/libGL.so.1
+    do
+        if [ -e "$candidate" ]; then
+            LIBGL_SO_PATH="$candidate"
+            break
+        fi
+    done
+fi
+if [ -n "${LIBGL_SO_PATH:-}" ]; then
+    export LD_PRELOAD="${LIBGL_SO_PATH}${LD_PRELOAD:+:${LD_PRELOAD}}"
+fi
 
 # Create logs directory
 LOG_DIR="${POLICY_DIR}/logs_single_$(date +%Y%m%d_%H%M%S)"
@@ -145,6 +195,7 @@ echo "Starting evaluation..."
 PYTHONWARNINGS=ignore::UserWarning \
 python script/eval_policy.py \
     --config "policy/${POLICY_NAME}/deploy_policy.yml" \
+    --policy_ckpt_path "${CHECKPOINT_PATH}" \
     --overrides \
     --task_name "${TASK_NAME}" \
     --task_config "${TASK_CONFIG}" \

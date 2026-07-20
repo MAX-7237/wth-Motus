@@ -31,13 +31,13 @@ logger = logging.getLogger(__name__)
 class MotusConfig:
     """Configuration for Motus."""
     # Video model settings
-    wan_checkpoint_path: str = "/share/home/bhz/pretrained_models/Wan2.2-TI2V-5B"
-    vae_path: str = "/share/home/bhz/pretrained_models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
-    wan_config_path: str = "/share/home/bhz/pretrained_models/Wan2.2-TI2V-5B"
+    wan_checkpoint_path: str = "/mnt/gyc_ckp/Wan2.2-TI2V-5B"
+    vae_path: str = "/mnt/gyc_ckp/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+    wan_config_path: str = "/mnt/gyc_ckp/Wan2.2-TI2V-5B"
     video_precision: str = "bfloat16"
 
     # VLM settings
-    vlm_checkpoint_path: str = "/share/home/bhz/pretrained_models/Qwen3-VL-2B-Instruct"
+    vlm_checkpoint_path: str = "./pretrained_models/Qwen3-VL-2B-Instruct"
     
     # Understanding Expert settings - configurable from yaml
     und_expert_hidden_size: int = 512        # Understanding expert hidden dimension
@@ -288,6 +288,40 @@ class UndModule(nn.Module):
         
         # Understanding Expert reference
         self.und_expert = und_expert
+
+    def _ensure_finite(
+        self,
+        tensor: torch.Tensor,
+        name: str,
+        *,
+        step_idx: Optional[int] = None,
+        layer_idx: Optional[int] = None,
+    ) -> None:
+        if tensor is None:
+            return
+        if torch.isfinite(tensor).all():
+            return
+        prefix = "[MOTUS_FINITE_CHECK]"
+        if step_idx is not None:
+            prefix += f" step={step_idx}"
+        if layer_idx is not None:
+            prefix += f" layer={layer_idx}"
+        finite_mask = torch.isfinite(tensor)
+        invalid_count = int((~finite_mask).sum().item())
+        finite_vals = tensor[finite_mask]
+        if finite_vals.numel() > 0:
+            min_val = float(finite_vals.min().item())
+            max_val = float(finite_vals.max().item())
+        else:
+            min_val = float("nan")
+            max_val = float("nan")
+        msg = (
+            f"{prefix} tensor={name} invalid_count={invalid_count} "
+            f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+            f"finite_min={min_val} finite_max={max_val}"
+        )
+        logger.error(msg)
+        raise RuntimeError(msg)
         
     def extract_und_features(
         self,
@@ -301,6 +335,11 @@ class UndModule(nn.Module):
 
         # Returns: inputs_embeds, attention_mask, visual_pos_masks, deepstack_image_embeds, position_ids
         inputs_embeds, attention_mask, visual_pos_masks, deepstack_image_embeds, position_ids = self._process_vlm_inputs_to_tokens(vlm_inputs, B)
+        self._ensure_finite(inputs_embeds, "und_inputs_embeds")
+        self._ensure_finite(position_ids, "und_position_ids")
+        if deepstack_image_embeds is not None:
+            for idx, tensor in enumerate(deepstack_image_embeds):
+                self._ensure_finite(tensor, f"und_deepstack_image_embeds[{idx}]")
 
         # Forward through VLM with proper attention_mask and DeepStack features
         vlm_kwargs = {
@@ -325,9 +364,11 @@ class UndModule(nn.Module):
 
         # Extract last layer features directly
         last_layer_features = vlm_output.hidden_states[-1]  # [B, seq_len, vlm_dim]
+        self._ensure_finite(last_layer_features, "und_last_layer_features")
 
         # [B, seq_len, vlm_dim] -> [B, seq_len, und_dim]
         adapted_features = self.und_expert.vlm_adapter(last_layer_features)
+        self._ensure_finite(adapted_features, "und_adapted_features")
 
         return adapted_features
         
@@ -342,6 +383,7 @@ class UndModule(nn.Module):
             # Old format: List[Dict] - do padding and batching
             input_ids_list = [vlm_input['input_ids'] for vlm_input in vlm_inputs]
             attention_mask_list = [vlm_input.get('attention_mask') for vlm_input in vlm_inputs]
+            mm_token_type_ids_list = [vlm_input.get('mm_token_type_ids') for vlm_input in vlm_inputs]
             pixel_values_list = [vlm_input.get('pixel_values') for vlm_input in vlm_inputs]
             image_grid_thw_list = [vlm_input.get('image_grid_thw') for vlm_input in vlm_inputs]
 
@@ -349,8 +391,9 @@ class UndModule(nn.Module):
             max_seq_len = max(ids.shape[1] for ids in input_ids_list)
             padded_input_ids = []
             padded_attention_masks = []
+            padded_mm_token_type_ids = []
             
-            for ids, mask in zip(input_ids_list, attention_mask_list):
+            for ids, mask, mm_token_type_ids in zip(input_ids_list, attention_mask_list, mm_token_type_ids_list):
                 if ids.shape[1] < max_seq_len:
                     padding_size = max_seq_len - ids.shape[1]
                     # Pad input_ids with zeros
@@ -359,37 +402,69 @@ class UndModule(nn.Module):
                     # Pad attention_mask with zeros (padding tokens should be ignored)
                     mask_padding = torch.zeros(mask.shape[0], padding_size, dtype=mask.dtype, device=mask.device)
                     padded_mask = torch.cat([mask, mask_padding], dim=1)
+                    if mm_token_type_ids is not None:
+                        mm_padding = torch.zeros(
+                            mm_token_type_ids.shape[0], padding_size, dtype=mm_token_type_ids.dtype, device=mm_token_type_ids.device
+                        )
+                        padded_mm = torch.cat([mm_token_type_ids, mm_padding], dim=1)
+                    else:
+                        padded_mm = None
                 else:
                     padded_ids = ids
                     padded_mask = mask
+                    padded_mm = mm_token_type_ids
                 padded_input_ids.append(padded_ids)
                 padded_attention_masks.append(padded_mask)
+                padded_mm_token_type_ids.append(padded_mm)
 
             # Batch process
             input_ids_batch = torch.cat(padded_input_ids, dim=0).to(self.device)
             attention_mask_batch = torch.cat(padded_attention_masks, dim=0).to(self.device)
+            mm_token_type_ids_batch = (
+                torch.cat([mm for mm in padded_mm_token_type_ids if mm is not None], dim=0).to(self.device)
+                if any(mm is not None for mm in padded_mm_token_type_ids)
+                else None
+            )
             pixel_values_batch = torch.cat([pv.to(self.device) for pv in pixel_values_list], dim=0)
             image_grid_thw_batch = torch.cat([igt.to(self.device) for igt in image_grid_thw_list], dim=0)
         else:
             # New format: Dict[str, Tensor] - already batched and padded by collate_fn
             input_ids_batch = vlm_inputs['input_ids'].to(self.device)
             attention_mask_batch = vlm_inputs['attention_mask'].to(self.device)
+            mm_token_type_ids_batch = (
+                vlm_inputs['mm_token_type_ids'].to(self.device)
+                if vlm_inputs.get('mm_token_type_ids') is not None
+                else None
+            )
             pixel_values_batch = vlm_inputs['pixel_values'].to(self.device)
             image_grid_thw_batch = vlm_inputs['image_grid_thw'].to(self.device)
 
         # Get input embeddings
         inputs_embeds = self.vlm_model.get_input_embeddings()(input_ids_batch)
+        self._ensure_finite(inputs_embeds, "vlm_inputs_embeds")
 
-        # Process images - handle different return formats between Qwen2.5-VL and Qwen3-VL
-        image_embeds, deepstack_image_embeds = self.vlm_model.get_image_features(pixel_values_batch, image_grid_thw_batch)
+        # Process images - support both tuple returns and HF output objects.
+        image_feature_outputs = self.vlm_model.get_image_features(
+            pixel_values_batch, image_grid_thw_batch, return_dict=True
+        )
+        if hasattr(image_feature_outputs, "pooler_output"):
+            image_embeds = image_feature_outputs.pooler_output
+            deepstack_image_embeds = image_feature_outputs.deepstack_features
+        else:
+            image_embeds, deepstack_image_embeds = image_feature_outputs
 
         image_embeds = torch.cat(image_embeds, dim=0).to(self.device, self.dtype)
+        self._ensure_finite(image_embeds, "vlm_image_embeds")
+        if deepstack_image_embeds is not None:
+            for idx, tensor in enumerate(deepstack_image_embeds):
+                self._ensure_finite(tensor, f"vlm_deepstack_image_embeds[{idx}]")
 
         # Insert image embeddings
         image_mask, _ = self.vlm_model.model.get_placeholder_mask(
             input_ids_batch, inputs_embeds=inputs_embeds, image_features=image_embeds
         )
         inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+        self._ensure_finite(inputs_embeds, "vlm_inputs_embeds_masked")
 
         visual_pos_masks = image_mask[..., 0]  # [B, seq_len] - visual positions only
 
@@ -399,8 +474,10 @@ class UndModule(nn.Module):
             input_ids=input_ids_batch,
             image_grid_thw=image_grid_thw_batch,
             video_grid_thw=None,  # No video in current implementation
-            attention_mask=attention_mask_batch
+            attention_mask=attention_mask_batch,
+            mm_token_type_ids=mm_token_type_ids_batch,
         )
+        self._ensure_finite(position_ids, "vlm_position_ids")
 
         return inputs_embeds, attention_mask_batch, visual_pos_masks, deepstack_image_embeds, position_ids
     
@@ -899,6 +976,33 @@ class Motus(nn.Module):
         Returns:
             Tuple of (predicted_frames, predicted_actions)
         """
+        def ensure_finite(tensor: torch.Tensor, name: str, step_idx: Optional[int] = None, layer_idx: Optional[int] = None):
+            if tensor is None:
+                return
+            if torch.isfinite(tensor).all():
+                return
+            prefix = "[MOTUS_FINITE_CHECK]"
+            if step_idx is not None:
+                prefix += f" step={step_idx}"
+            if layer_idx is not None:
+                prefix += f" layer={layer_idx}"
+            finite_mask = torch.isfinite(tensor)
+            invalid_count = int((~finite_mask).sum().item())
+            finite_vals = tensor[finite_mask]
+            if finite_vals.numel() > 0:
+                min_val = float(finite_vals.min().item())
+                max_val = float(finite_vals.max().item())
+            else:
+                min_val = float("nan")
+                max_val = float("nan")
+            msg = (
+                f"{prefix} tensor={name} invalid_count={invalid_count} "
+                f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+                f"finite_min={min_val} finite_max={max_val}"
+            )
+            logger.error(msg)
+            raise RuntimeError(msg)
+
         B = first_frame.shape[0]
 
         language_embeddings = [emb.to(self.device).to(self.dtype) for emb in language_embeddings]
@@ -910,6 +1014,7 @@ class Motus(nn.Module):
         first_frame_norm = (first_frame * 2.0 - 1.0).unsqueeze(2)   # [0,1] -> [-1,1], [B, C, 1, H, W]
         with torch.no_grad():
             condition_frame_latent = self.video_model.encode_video(first_frame_norm.to(self.dtype))   # [B, C', 1, H', W']
+        ensure_finite(condition_frame_latent, "condition_frame_latent")
 
         # Init video/action latents
         B, C_latent, f_latent, H_latent, W_latent = condition_frame_latent.shape
@@ -922,9 +1027,11 @@ class Motus(nn.Module):
         # 2. Understanding Expert features and T5 context
         # Extract understanding features from VLM
         und_tokens = self.und_module.extract_und_features(vlm_inputs)
+        ensure_finite(und_tokens, "und_tokens_init")
 
         # T5 preprocess
         processed_t5_context = self.video_module.preprocess_t5_embeddings(language_embeddings)
+        ensure_finite(processed_t5_context, "processed_t5_context")
 
         # 3. Denoising loop: from noise (t=1) to clean (t=0)
         timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=self.device, dtype=self.dtype)
@@ -938,13 +1045,16 @@ class Motus(nn.Module):
 
             # Tokens with Registers
             video_tokens = self.video_module.prepare_input(video_latent.to(self.dtype))
+            ensure_finite(video_tokens, "video_tokens_pre", step_idx=i)
             state_tokens = state.unsqueeze(1).to(self.dtype)
             # Expand registers for batch
             registers = self.action_expert.registers.expand(B, -1, -1)  # [B, num_registers, dim]
             action_tokens = self.action_expert.input_encoder(state_tokens, action_latent, registers)
+            ensure_finite(action_tokens, "action_tokens_pre", step_idx=i)
 
             # Note: Understanding tokens already extracted before the loop, will be updated in joint attention
             und_tokens = self.und_module.extract_und_features(vlm_inputs)  # [B, num_queries * num_layers, und_dim]
+            ensure_finite(und_tokens, "und_tokens_loop", step_idx=i)
 
             
             # Trimodal MoT forward - joint denoising for WAN, Action, Understanding
@@ -952,6 +1062,8 @@ class Motus(nn.Module):
                 # Time embeddings
                 video_head_time_emb, video_adaln_params = self.video_module.get_time_embedding(video_t_scaled, video_tokens.shape[1])
                 action_head_time_emb, action_adaln_params = self.action_module.get_time_embedding(action_t_scaled, action_tokens.shape[1])
+                ensure_finite(video_adaln_params, "video_adaln_params", step_idx=i)
+                ensure_finite(action_adaln_params, "action_adaln_params", step_idx=i)
 
                 # Process through all layers - trimodal denoising of WAN, Action, Understanding
                 for layer_idx in range(self.config.num_layers):
@@ -965,27 +1077,37 @@ class Motus(nn.Module):
                         self.action_expert.blocks[layer_idx],
                         und_tokens, self.und_expert.blocks[layer_idx]
                     )
+                    ensure_finite(video_tokens, "video_tokens_post_joint", step_idx=i, layer_idx=layer_idx)
+                    ensure_finite(action_tokens, "action_tokens_post_joint", step_idx=i, layer_idx=layer_idx)
+                    ensure_finite(und_tokens, "und_tokens_post_joint", step_idx=i, layer_idx=layer_idx)
 
                     # WAN cross-attention with T5 embeddings 
                     video_tokens = self.video_module.process_cross_attention(
                         video_tokens, video_adaln_params, layer_idx, processed_t5_context
                     )
+                    ensure_finite(video_tokens, "video_tokens_post_cross", step_idx=i, layer_idx=layer_idx)
 
                     # FFNs: WAN, Action, Understanding
                     video_tokens = self.video_module.process_ffn(video_tokens, video_adaln_modulation, layer_idx)
                     action_tokens = self.action_module.process_ffn(action_tokens, action_adaln_modulation, layer_idx)
                     und_tokens = self.und_module.process_ffn(und_tokens, layer_idx)
+                    ensure_finite(video_tokens, "video_tokens_post_ffn", step_idx=i, layer_idx=layer_idx)
+                    ensure_finite(action_tokens, "action_tokens_post_ffn", step_idx=i, layer_idx=layer_idx)
+                    ensure_finite(und_tokens, "und_tokens_post_ffn", step_idx=i, layer_idx=layer_idx)
 
                 # Heads (velocities)
                 video_velocity = self.video_module.apply_output_head(video_tokens, video_head_time_emb)
                 # Use decoder with all tokens (including registers)
                 action_pred_full = self.action_expert.decoder(action_tokens, action_head_time_emb)
+                ensure_finite(action_pred_full, "action_pred_full", step_idx=i)
                 # Extract middle action chunk (skip first state token and last register tokens)
                 action_velocity = action_pred_full[:, 1:-self.action_expert.config.num_registers, :]
+                ensure_finite(action_velocity, "action_velocity", step_idx=i)
 
                 # Euler integration
                 video_latent = video_latent + video_velocity * dt
                 action_latent = action_latent + action_velocity * dt
+                ensure_finite(action_latent, "action_latent", step_idx=i)
 
                 # Teacher Forcing
                 video_latent[:, :, 0:1] = condition_frame_latent
@@ -998,6 +1120,7 @@ class Motus(nn.Module):
             predicted_frames = torch.clamp(predicted_frames, 0, 1).float()
         
         predicted_actions = action_latent.float()  # [B, action_chunk_size, 14]
+        ensure_finite(predicted_actions, "predicted_actions_final")
 
         return predicted_frames, predicted_actions
 

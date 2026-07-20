@@ -5,10 +5,14 @@ import math
 from pathlib import Path
 
 import torch
-import deepspeed.comm.comm as dist
 import imageio
 from safetensors import safe_open
 import numpy as np
+
+try:
+    import deepspeed.comm.comm as _dist_backend
+except Exception:  # pragma: no cover - inference can run without deepspeed
+    import torch.distributed as _dist_backend
 
 
 DTYPE_MAP = {
@@ -27,7 +31,9 @@ AUTOCAST_DTYPE = None
 
 
 def get_rank():
-    return dist.get_rank()
+    if not _dist_backend.is_available() or not _dist_backend.is_initialized():
+        return 0
+    return _dist_backend.get_rank()
 
 
 def is_main_process():
@@ -36,11 +42,11 @@ def is_main_process():
 
 @contextmanager
 def zero_first():
-    if not is_main_process():
-        dist.barrier()
+    if _dist_backend.is_available() and _dist_backend.is_initialized() and not is_main_process():
+        _dist_backend.barrier()
     yield
-    if is_main_process():
-        dist.barrier()
+    if _dist_backend.is_available() and _dist_backend.is_initialized() and is_main_process():
+        _dist_backend.barrier()
 
 
 def empty_cuda_cache():
