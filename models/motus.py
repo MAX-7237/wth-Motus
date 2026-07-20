@@ -4,6 +4,7 @@
 
 import sys
 import json
+import inspect
 import torch
 import logging
 import torch.nn as nn
@@ -444,8 +445,12 @@ class UndModule(nn.Module):
         self._ensure_finite(inputs_embeds, "vlm_inputs_embeds")
 
         # Process images - support both tuple returns and HF output objects.
+        get_image_features_params = inspect.signature(self.vlm_model.get_image_features).parameters
+        image_feature_kwargs = {}
+        if "return_dict" in get_image_features_params:
+            image_feature_kwargs["return_dict"] = True
         image_feature_outputs = self.vlm_model.get_image_features(
-            pixel_values_batch, image_grid_thw_batch, return_dict=True
+            pixel_values_batch, image_grid_thw_batch, **image_feature_kwargs
         )
         if hasattr(image_feature_outputs, "pooler_output"):
             image_embeds = image_feature_outputs.pooler_output
@@ -470,13 +475,16 @@ class UndModule(nn.Module):
 
         # Compute position_ids (position_ids remains as original: [3, B, seq_len])
         # Qwen3-VL get_rope_index has different signature: (input_ids, image_grid_thw, video_grid_thw, attention_mask)
-        position_ids, _rope_deltas = self.vlm_model.model.get_rope_index(
-            input_ids=input_ids_batch,
-            image_grid_thw=image_grid_thw_batch,
-            video_grid_thw=None,  # No video in current implementation
-            attention_mask=attention_mask_batch,
-            mm_token_type_ids=mm_token_type_ids_batch,
-        )
+        get_rope_index_params = inspect.signature(self.vlm_model.model.get_rope_index).parameters
+        rope_index_kwargs = {
+            "input_ids": input_ids_batch,
+            "image_grid_thw": image_grid_thw_batch,
+            "video_grid_thw": None,  # No video in current implementation
+            "attention_mask": attention_mask_batch,
+        }
+        if "mm_token_type_ids" in get_rope_index_params:
+            rope_index_kwargs["mm_token_type_ids"] = mm_token_type_ids_batch
+        position_ids, _rope_deltas = self.vlm_model.model.get_rope_index(**rope_index_kwargs)
         self._ensure_finite(position_ids, "vlm_position_ids")
 
         return inputs_embeds, attention_mask_batch, visual_pos_masks, deepstack_image_embeds, position_ids

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import json
 import time
+import hashlib
 
 import numpy as np
 import torch
@@ -108,6 +109,17 @@ class _LocalV3Metadata:
     def fps(self) -> int:
         return int(self.info["fps"])
 
+    @property
+    def min_video_fps(self) -> Optional[float]:
+        video_fps_values = []
+        for feature in self.features.values():
+            if feature.get("dtype") != "video":
+                continue
+            video_fps = feature.get("info", {}).get("video.fps")
+            if video_fps is not None and float(video_fps) > 0:
+                video_fps_values.append(float(video_fps))
+        return min(video_fps_values) if video_fps_values else None
+
     def get_video_file_path(self, ep_index: int, vid_key: str) -> Path:
         ep = self._episodes_by_index[int(ep_index)]
         chunk = int(ep.get(f"videos/{vid_key}/chunk_index", ep.get("data/chunk_index", 0)))
@@ -148,7 +160,8 @@ class _LocalV3LeRobotDataset:
         self.episodes = episodes
         self.meta = _LocalV3Metadata(self.root)
         self.features = self.meta.features
-        self.tolerance_s = 0.0001
+        min_video_fps = self.meta.min_video_fps
+        self.tolerance_s = max(0.0001, 0.5 / min_video_fps) if min_video_fps else 0.0001
         self.video_backend = video_backend or "pyav"
 
         selected = list(episodes) if episodes is not None else sorted(self.meta.episodes.keys())
@@ -440,7 +453,12 @@ class LeRobotMotusDataset(data.Dataset):
                     raise ValueError("sampling_groups requires a local root path")
                 self.repo_ids, self.sampling_group_specs = self._build_sampling_groups(self.sampling_groups)
             elif self.task_name == None:
-                self.repo_ids = [task_name for task_name in os.listdir(self.root) if os.path.isdir(os.path.join(self.root, task_name))]
+                self.repo_ids = [
+                    task_name
+                    for task_name in sorted(os.listdir(self.root))
+                    if _is_local_v3_lerobot_root(os.path.join(self.root, task_name))
+                    or os.path.isfile(os.path.join(self.root, task_name, "meta", "info.json"))
+                ]
             elif isinstance(self.task_name, list):
                 self.repo_ids = self.task_name
                 for task_name in self.repo_ids:
@@ -490,16 +508,25 @@ class LeRobotMotusDataset(data.Dataset):
                 tmp_frame_cnt += int(self.lerobot_dataset._datasets[idx].num_frames)
                 self.frame_num_accumulated.append(tmp_frame_cnt)
             if self.sampling_group_specs:
-                dataset_cursor = 0
+                repo_id_to_dataset_idx = {repo_id: idx for idx, repo_id in enumerate(self.repo_ids)}
+                active_group_specs = []
                 for group_spec in self.sampling_group_specs:
-                    dataset_indices = list(range(dataset_cursor, dataset_cursor + len(group_spec["repo_ids"])))
-                    dataset_cursor += len(group_spec["repo_ids"])
+                    dataset_indices = [
+                        repo_id_to_dataset_idx[repo_id]
+                        for repo_id in group_spec["repo_ids"]
+                        if repo_id in repo_id_to_dataset_idx
+                    ]
                     episode_count = sum(len(self.episode_ids[self.repo_ids[idx]]) for idx in dataset_indices)
                     if episode_count <= 0:
-                        raise ValueError(f"Sampling group '{group_spec['name']}' contains no episodes")
+                        logger.warning(
+                            f"Sampling group '{group_spec['name']}' contains no selected episodes; skipping it"
+                        )
+                        continue
+                    active_group_specs.append(group_spec)
                     self.sampling_group_dataset_indices.append(dataset_indices)
                     self.sampling_group_episode_counts.append(episode_count)
                     self.sampling_group_weights.append(float(group_spec["weight"]))
+                self.sampling_group_specs = active_group_specs
 
         # Episode-level embedding cache (for external t5 embedding files referenced from meta/episodes.jsonl)
         # key: global episode_index (int) ; value: torch.Tensor
@@ -721,12 +748,19 @@ class LeRobotMotusDataset(data.Dataset):
             raise RuntimeError("LeRobotDataset not initialized")
         return Path(self.lerobot_dataset.root) / "meta" / "episodes.jsonl"
 
+    def _current_t5_root(self) -> Path:
+        return Path(getattr(self, "_active_t5_root", self.lerobot_dataset.root))
+
     def _t5_cache_file_path(self, episode_index: int) -> Path:
         """Absolute path: {dataset_root}/{t5_folder_name}/episode_XXXXXX.pt"""
-        return Path(self.lerobot_dataset.root) / self.t5_folder_name / f"episode_{episode_index:06d}.pt"
+        return self._current_t5_root() / self.t5_folder_name / f"episode_{episode_index:06d}.pt"
+
+    def _t5_task_cache_file_path(self, instruction: str) -> Path:
+        digest = hashlib.sha1(instruction.encode("utf-8")).hexdigest()[:16]
+        return self._current_t5_root() / self.t5_folder_name / f"task_{digest}.pt"
 
     def _t5_lock_file_path(self, episode_index: int) -> Path:
-        return Path(self.lerobot_dataset.root) / self.t5_folder_name / f"episode_{episode_index:06d}.pt.lock"
+        return self._current_t5_root() / self.t5_folder_name / f"episode_{episode_index:06d}.pt.lock"
 
     def _atomic_update_episodes_jsonl(self, episode_index: int, updates: Dict[str, Any]) -> None:
         """
@@ -827,6 +861,13 @@ class LeRobotMotusDataset(data.Dataset):
                 emb = torch.tensor(emb)
             return emb
 
+        task_pt = self._t5_task_cache_file_path(instruction)
+        if task_pt.exists():
+            emb = torch.load(task_pt, map_location="cpu")
+            if not isinstance(emb, torch.Tensor):
+                emb = torch.tensor(emb)
+            return emb
+
         # Simple file lock (avoid duplicate work across workers)
         lock_path = self._t5_lock_file_path(episode_index)
         start = time.time()
@@ -872,7 +913,12 @@ class LeRobotMotusDataset(data.Dataset):
                 emb = emb.squeeze(0)
 
             # Save CPU tensor
-            torch.save(emb.detach().cpu(), out_pt)
+            emb_cpu = emb.detach().cpu()
+            torch.save(emb_cpu, out_pt)
+            try:
+                torch.save(emb_cpu, task_pt)
+            except Exception as e:
+                logger.warning(f"Failed to save task-level T5 cache {task_pt}: {e}")
 
             # Write back meta/episodes.jsonl (relative path)
             rel = f"{self.t5_folder_name}/episode_{episode_index:06d}.pt"
@@ -1156,7 +1202,14 @@ class LeRobotMotusDataset(data.Dataset):
                         instr = ds_for_embedding.meta.get_episode_task(ep_index)
                     if not isinstance(instr, str):
                         instr = str(instr)
-                    emb = self._encode_and_cache_t5_embedding(ep_index, instr)
+                    self._active_t5_root = Path(ds_for_embedding.root)
+                    try:
+                        emb = self._encode_and_cache_t5_embedding(ep_index, instr)
+                    finally:
+                        try:
+                            del self._active_t5_root
+                        except AttributeError:
+                            pass
                     self._episode_embedding_cache[ep_index] = emb if isinstance(emb, torch.Tensor) else torch.tensor(emb)
                     cached = self._episode_embedding_cache[ep_index]
                     all_embeddings = cached
