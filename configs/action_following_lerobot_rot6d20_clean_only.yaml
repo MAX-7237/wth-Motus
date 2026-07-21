@@ -107,7 +107,7 @@ training:
   find_unused_parameters: false
 
 system:
-  checkpoint_dir: "./checkpoints"
+  checkpoint_dir: "/mnt/gyc_ckp/wth-Motus/checkpoints"
   log_level: "INFO"
 
   log_interval: 1
