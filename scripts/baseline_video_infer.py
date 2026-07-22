@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run single-sample Motus baseline inference and save video/action outputs."""
+"""Run single-sample Motus joint or world-model inference and save outputs."""
 
 import argparse
 import json
@@ -45,7 +45,8 @@ def _resolve_output_dir(args: argparse.Namespace) -> Path:
     if args.out_dir:
         return Path(args.out_dir)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return PROJECT_ROOT / "outputs" / f"baseline_{args.variant}_{timestamp}"
+    prefix = "wm" if getattr(args, "mode", "joint") == "wm" else "baseline"
+    return PROJECT_ROOT / "outputs" / f"{prefix}_{args.variant}_{timestamp}"
 
 
 def _resolve_checkpoint(args: argparse.Namespace, cfg: Dict[str, Any], config_path: Path) -> Path:
@@ -172,6 +173,98 @@ def _load_state(args: argparse.Namespace, cfg: Dict[str, Any]) -> Tuple[torch.Te
     return normalized, raw
 
 
+def _extract_action_payload(loaded: Any, source: Path) -> Any:
+    if isinstance(loaded, dict):
+        for key in (
+            "action_sequence",
+            "actions",
+            "pred_actions_normalized",
+            "pred_actions_denormalized",
+            "action_condition_normalized",
+            "action_condition_denormalized",
+        ):
+            if key in loaded:
+                return loaded[key]
+        available = ", ".join(str(k) for k in loaded.keys())
+        raise KeyError(f"No action array key found in {source}. Available keys: {available}")
+    return loaded
+
+
+def _load_action_file(path: str | Path) -> torch.Tensor:
+    source = Path(path)
+    suffix = source.suffix.lower()
+    if suffix == ".npy":
+        loaded = np.load(source, allow_pickle=False)
+    elif suffix == ".npz":
+        npz = np.load(source, allow_pickle=False)
+        for key in (
+            "action_sequence",
+            "actions",
+            "pred_actions_normalized",
+            "pred_actions_denormalized",
+            "action_condition_normalized",
+            "action_condition_denormalized",
+        ):
+            if key in npz:
+                loaded = npz[key]
+                break
+        else:
+            keys = list(npz.files)
+            if len(keys) != 1:
+                raise KeyError(f"Multiple arrays in {source}; expected one action array key, got {keys}")
+            loaded = npz[keys[0]]
+    elif suffix in {".pt", ".pth"}:
+        loaded = _extract_action_payload(torch.load(source, map_location="cpu"), source)
+    elif suffix == ".json":
+        with open(source, "r", encoding="utf-8") as f:
+            loaded = _extract_action_payload(json.load(f), source)
+    else:
+        raise ValueError(f"Unsupported action file suffix '{suffix}'. Use .npy, .npz, .pt, .pth, or .json")
+
+    tensor = torch.as_tensor(loaded, dtype=torch.float32).detach().cpu()
+    if tensor.ndim == 3 and tensor.shape[0] == 1:
+        tensor = tensor.squeeze(0)
+    if tensor.ndim != 2:
+        raise ValueError(f"Expected action sequence shaped [T,D] or [1,T,D], got {tuple(tensor.shape)}")
+    return tensor
+
+
+def _load_action_sequence(
+    args: argparse.Namespace,
+    cfg: Dict[str, Any],
+    expected_chunk_size: int,
+    expected_action_dim: int,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    if not args.actions:
+        raise ValueError("--actions is required when --mode wm")
+
+    action_values = _load_action_file(args.actions)
+    expected_shape = (expected_chunk_size, expected_action_dim)
+    if tuple(action_values.shape) != expected_shape:
+        raise ValueError(
+            "Action sequence shape mismatch: "
+            f"expected {expected_shape}, got {tuple(action_values.shape)} from {args.actions}"
+        )
+
+    dataset_cfg = cfg.get("dataset", {}).get("params", {})
+    if not dataset_cfg.get("normalize_action_state", False):
+        return action_values, None
+
+    action_min, action_max, _state_min, _state_max = load_action_state_normalization_stats(
+        dataset_cfg["normalization_stats_path"],
+        dataset_cfg["normalization_dataset_key"],
+    )
+    if action_min is None or action_max is None:
+        raise RuntimeError("Failed to load action normalization stats")
+
+    if args.actions_are_raw:
+        normalized = normalize_actions(action_values, action_min, action_max)
+        return normalized, action_values
+
+    denormalized = denormalize_actions(action_values, action_min, action_max)
+    return action_values, denormalized
+
+
 def _as_single_t5_embedding(value: Any) -> torch.Tensor:
     tensor = torch.as_tensor(value).detach().cpu().float()
     if tensor.ndim == 3 and tensor.shape[0] == 1:
@@ -230,10 +323,11 @@ def _save_outputs(
     input_image: Image.Image,
     first_frame: torch.Tensor,
     pred_frames_tchw: torch.Tensor,
-    pred_actions_norm: torch.Tensor,
+    pred_actions_norm: Optional[torch.Tensor],
     pred_actions_raw: Optional[torch.Tensor],
     fps: int,
     manifest: Dict[str, Any],
+    action_output_prefix: str = "pred_actions",
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     input_image.save(out_dir / "input.png")
@@ -247,21 +341,31 @@ def _save_outputs(
     grid = np.concatenate(video_frames, axis=1)
     Image.fromarray(grid).save(out_dir / "pred_grid.png")
 
-    np.save(out_dir / "pred_actions_normalized.npy", pred_actions_norm.detach().cpu().float().numpy())
+    if pred_actions_norm is not None:
+        np.save(
+            out_dir / f"{action_output_prefix}_normalized.npy",
+            pred_actions_norm.detach().cpu().float().numpy(),
+        )
     if pred_actions_raw is not None:
-        np.save(out_dir / "pred_actions_denormalized.npy", pred_actions_raw.detach().cpu().float().numpy())
+        np.save(
+            out_dir / f"{action_output_prefix}_denormalized.npy",
+            pred_actions_raw.detach().cpu().float().numpy(),
+        )
 
     with open(out_dir / "manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Motus baseline video generation inference")
+    parser = argparse.ArgumentParser(description="Motus joint or action-conditioned world-model inference")
+    parser.add_argument("--mode", choices=("joint", "wm"), default="joint", help="joint predicts video+actions; wm predicts video from clean actions")
     parser.add_argument("--variant", choices=sorted(DEFAULT_CONFIGS), default="clean", help="Default config/checkpoint family")
     parser.add_argument("--config", default=None, help="Training YAML used for the checkpoint")
     parser.add_argument("--ckpt", default=None, help="Checkpoint file or checkpoint_step_* directory; defaults to latest for the selected config")
     parser.add_argument("--image", required=True, help="Conditioning RGB image")
     parser.add_argument("--instruction", required=True, help="Text instruction")
+    parser.add_argument("--actions", default=None, help="Action sequence for --mode wm; accepts .npy/.npz/.pt/.pth/.json shaped [T,D] or [1,T,D]")
+    parser.add_argument("--actions_are_raw", action="store_true", help="Treat --actions as raw Rot6D20 actions and normalize before WM inference")
     parser.add_argument("--out_dir", default=None, help="Output directory")
     parser.add_argument("--state", default=None, help="Comma-separated raw state values; defaults to zeros")
     parser.add_argument("--state_json", default=None, help="JSON list of raw state values")
@@ -296,27 +400,50 @@ def main() -> None:
     vlm_inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in vlm_inputs.items()}
 
     num_steps = args.num_inference_steps or int(cfg["model"]["inference"]["num_inference_timesteps"])
-    with torch.no_grad():
-        pred_frames, pred_actions_norm = model.inference_step(
-            first_frame=first_frame_cpu.to(device),
-            state=state_norm_cpu.unsqueeze(0).to(device),
-            num_inference_steps=num_steps,
-            language_embeddings=[emb.to(device) for emb in language_embeddings],
-            vlm_inputs=vlm_inputs,
+    dataset_cfg = cfg.get("dataset", {}).get("params", {})
+
+    if args.mode == "wm":
+        action_condition_norm_cpu, action_condition_raw_cpu = _load_action_sequence(
+            args,
+            cfg,
+            expected_chunk_size=int(model.config.action_chunk_size),
+            expected_action_dim=int(model.config.action_dim),
         )
+        with torch.no_grad():
+            pred_frames = model.world_model_inference_step(
+                first_frame=first_frame_cpu.to(device),
+                action_sequence=action_condition_norm_cpu.unsqueeze(0).to(device),
+                state=state_norm_cpu.unsqueeze(0).to(device),
+                num_inference_steps=num_steps,
+                language_embeddings=[emb.to(device) for emb in language_embeddings],
+                vlm_inputs=vlm_inputs,
+            )
+        pred_actions_norm_cpu = action_condition_norm_cpu.detach().cpu().float()
+        pred_actions_raw = action_condition_raw_cpu.detach().cpu().float() if action_condition_raw_cpu is not None else None
+        action_output_prefix = "action_condition"
+    else:
+        with torch.no_grad():
+            pred_frames, pred_actions_norm = model.inference_step(
+                first_frame=first_frame_cpu.to(device),
+                state=state_norm_cpu.unsqueeze(0).to(device),
+                num_inference_steps=num_steps,
+                language_embeddings=[emb.to(device) for emb in language_embeddings],
+                vlm_inputs=vlm_inputs,
+            )
+        pred_actions_norm_cpu = pred_actions_norm[0].detach().cpu().float()
+        pred_actions_raw = None
+        if dataset_cfg.get("normalize_action_state", False):
+            action_min, action_max, _state_min, _state_max = load_action_state_normalization_stats(
+                dataset_cfg["normalization_stats_path"],
+                dataset_cfg["normalization_dataset_key"],
+            )
+            pred_actions_raw = denormalize_actions(pred_actions_norm_cpu, action_min, action_max)
+        action_output_prefix = "pred_actions"
 
     pred_frames_tchw = _frames_bcthw_to_tchw(pred_frames)
-    pred_actions_norm_cpu = pred_actions_norm[0].detach().cpu().float()
-    pred_actions_raw = None
-    dataset_cfg = cfg.get("dataset", {}).get("params", {})
-    if dataset_cfg.get("normalize_action_state", False):
-        action_min, action_max, _state_min, _state_max = load_action_state_normalization_stats(
-            dataset_cfg["normalization_stats_path"],
-            dataset_cfg["normalization_dataset_key"],
-        )
-        pred_actions_raw = denormalize_actions(pred_actions_norm_cpu, action_min, action_max)
 
     manifest = {
+        "mode": args.mode,
         "config": str(config_path.resolve()),
         "checkpoint": str(ckpt_file.resolve()),
         "checkpoint_missing_keys": missing,
@@ -332,12 +459,23 @@ def main() -> None:
         "outputs": {
             "video": "pred_video.mp4",
             "grid": "pred_grid.png",
-            "actions_normalized": "pred_actions_normalized.npy",
-            "actions_denormalized": "pred_actions_denormalized.npy" if pred_actions_raw is not None else None,
+            "actions_normalized": f"{action_output_prefix}_normalized.npy",
+            "actions_denormalized": f"{action_output_prefix}_denormalized.npy" if pred_actions_raw is not None else None,
         },
         "predicted_frames_shape_tchw": list(pred_frames_tchw.shape),
-        "predicted_actions_shape": list(pred_actions_norm_cpu.shape),
+        "actions_shape": list(pred_actions_norm_cpu.shape),
     }
+    if args.mode == "wm":
+        manifest.update(
+            {
+                "actions": str(Path(args.actions).resolve()),
+                "actions_are_raw_input": bool(args.actions_are_raw),
+                "action_condition_shape": list(pred_actions_norm_cpu.shape),
+            }
+        )
+    else:
+        manifest["predicted_actions_shape"] = list(pred_actions_norm_cpu.shape)
+
     _save_outputs(
         out_dir,
         args.instruction,
@@ -348,8 +486,9 @@ def main() -> None:
         pred_actions_raw,
         args.fps,
         manifest,
+        action_output_prefix=action_output_prefix,
     )
-    print(f"Saved baseline inference outputs to {out_dir}")
+    print(f"Saved {args.mode} inference outputs to {out_dir}")
     print(json.dumps(manifest["outputs"], indent=2))
 
 

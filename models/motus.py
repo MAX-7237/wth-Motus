@@ -1158,6 +1158,212 @@ class Motus(nn.Module):
 
         return predicted_frames, predicted_actions
 
+    @torch.no_grad()
+    def world_model_inference_step(
+        self,
+        first_frame: torch.Tensor,
+        action_sequence: torch.Tensor,
+        state: torch.Tensor = None,
+        num_inference_steps: int = 50,
+        language_embeddings: Optional[List[torch.Tensor]] = None,
+        vlm_inputs: Optional[List] = None,
+        return_latent: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Action-conditioned world-model inference.
+
+        Implements the appendix-style world-model sampler:
+          p(o_{t+1:t+k} | o_t, a_{t+1:t+k}, language)
+
+        The future observation/video latent starts from Gaussian noise and is
+        denoised from tau=1 -> 0. The provided action chunk is kept clean at
+        tau_a=0 for every denoising step; only the video latent is integrated.
+
+        Args:
+            first_frame: Condition observation o_t, shape [B, C, H, W] in [0, 1].
+            action_sequence: Clean action condition a_{t+1:t+k}, shape
+                [B, action_chunk_size, action_dim]. Use the same normalization
+                convention as training.
+            state: Initial robot state, shape [B, state_dim]. Required in
+                finetune mode because the action encoder was trained with state.
+            num_inference_steps: Number of Euler denoising steps.
+            language_embeddings: Pre-encoded T5 embeddings for WAN cross-attn.
+            vlm_inputs: VLM inputs for the understanding expert.
+            return_latent: If True, also return final video latent.
+
+        Returns:
+            predicted_frames: Future observations [B, T, C, H, W] in [0, 1].
+            If return_latent=True, returns (predicted_frames, video_latent).
+        """
+        def ensure_finite(
+            tensor: torch.Tensor,
+            name: str,
+            step_idx: Optional[int] = None,
+            layer_idx: Optional[int] = None,
+        ):
+            if tensor is None:
+                return
+            if torch.isfinite(tensor).all():
+                return
+            prefix = "[MOTUS_WM_FINITE_CHECK]"
+            if step_idx is not None:
+                prefix += f" step={step_idx}"
+            if layer_idx is not None:
+                prefix += f" layer={layer_idx}"
+            finite_mask = torch.isfinite(tensor)
+            invalid_count = int((~finite_mask).sum().item())
+            finite_vals = tensor[finite_mask]
+            if finite_vals.numel() > 0:
+                min_val = float(finite_vals.min().item())
+                max_val = float(finite_vals.max().item())
+            else:
+                min_val = float("nan")
+                max_val = float("nan")
+            msg = (
+                f"{prefix} tensor={name} invalid_count={invalid_count} "
+                f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+                f"finite_min={min_val} finite_max={max_val}"
+            )
+            logger.error(msg)
+            raise RuntimeError(msg)
+
+        if action_sequence is None:
+            raise ValueError("world_model_inference_step requires a clean action_sequence condition")
+        if first_frame.ndim != 4:
+            raise ValueError(f"first_frame must be [B,C,H,W], got shape={tuple(first_frame.shape)}")
+        if action_sequence.ndim != 3:
+            raise ValueError(
+                f"action_sequence must be [B,action_chunk_size,action_dim], "
+                f"got shape={tuple(action_sequence.shape)}"
+            )
+
+        B = first_frame.shape[0]
+        expected_action_shape = (B, self.config.action_chunk_size, self.config.action_dim)
+        if tuple(action_sequence.shape) != expected_action_shape:
+            raise ValueError(
+                "action_sequence shape mismatch: "
+                f"expected {expected_action_shape}, got {tuple(action_sequence.shape)}"
+            )
+        if self.config.training_mode != "pretrain" and state is None:
+            raise ValueError("state is required for finetune world-model inference")
+        if language_embeddings is None:
+            raise ValueError("language_embeddings is required for WAN cross-attention")
+        if num_inference_steps <= 0:
+            raise ValueError(f"num_inference_steps must be positive, got {num_inference_steps}")
+
+        if isinstance(language_embeddings, torch.Tensor):
+            language_embeddings = [emb.to(self.device).to(self.dtype) for emb in language_embeddings]
+        else:
+            language_embeddings = [emb.to(self.device).to(self.dtype) for emb in language_embeddings]
+
+        first_frame = first_frame.to(self.device).to(self.dtype)
+        clean_actions = action_sequence.to(self.device).to(self.dtype)
+        if state is not None:
+            state = state.to(self.device).to(self.dtype)
+
+        # Encode the condition observation o_t.
+        first_frame_norm = (first_frame * 2.0 - 1.0).unsqueeze(2)
+        condition_frame_latent = self.video_model.encode_video(first_frame_norm.to(self.dtype))
+        ensure_finite(condition_frame_latent, "condition_frame_latent")
+
+        # Initialize future observations from Gaussian noise while teacher-forcing o_t.
+        B, C_latent, _f_latent, H_latent, W_latent = condition_frame_latent.shape
+        num_total_latent_frames = 1 + self.config.num_video_frames // 4
+        video_latent = torch.randn(
+            (B, C_latent, num_total_latent_frames, H_latent, W_latent),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        video_latent[:, :, 0:1] = condition_frame_latent
+
+        processed_t5_context = self.video_module.preprocess_t5_embeddings(language_embeddings)
+        ensure_finite(processed_t5_context, "processed_t5_context")
+
+        # Appendix Alg. 3: tau_o descends 1 -> 0, tau_a is fixed to 0.
+        timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=self.device, dtype=self.dtype)
+        zero_action_t = torch.zeros((B,), device=self.device, dtype=self.dtype)
+
+        for i in range(num_inference_steps):
+            tau = timesteps[i]
+            tau_next = timesteps[i + 1]
+            dt = tau_next - tau
+
+            video_t_scaled = (tau * 1000).expand(B).to(self.dtype)
+            action_t_scaled = zero_action_t
+
+            video_tokens = self.video_module.prepare_input(video_latent.to(self.dtype))
+            ensure_finite(video_tokens, "wm_video_tokens_pre", step_idx=i)
+
+            if self.action_expert.config.num_registers > 0 and self.action_expert.registers is not None:
+                registers = self.action_expert.registers.expand(B, -1, -1)
+            else:
+                registers = None
+            if self.config.training_mode == "pretrain":
+                action_tokens = self.action_expert.input_encoder(None, clean_actions, registers)
+            else:
+                state_tokens = state.unsqueeze(1).to(self.dtype)
+                action_tokens = self.action_expert.input_encoder(state_tokens, clean_actions, registers)
+            ensure_finite(action_tokens, "wm_action_tokens_clean", step_idx=i)
+
+            und_tokens = self.und_module.extract_und_features(vlm_inputs)
+            ensure_finite(und_tokens, "wm_und_tokens", step_idx=i)
+
+            with torch.autocast(device_type="cuda", dtype=self.video_model.precision):
+                video_head_time_emb, video_adaln_params = self.video_module.get_time_embedding(
+                    video_t_scaled, video_tokens.shape[1]
+                )
+                action_head_time_emb, action_adaln_params = self.action_module.get_time_embedding(
+                    action_t_scaled, action_tokens.shape[1]
+                )
+
+                for layer_idx in range(self.config.num_layers):
+                    video_adaln_modulation = self.video_module.compute_adaln_modulation(
+                        video_adaln_params, layer_idx
+                    )
+                    action_adaln_modulation = self.action_module.compute_adaln_modulation(
+                        action_adaln_params, layer_idx
+                    )
+
+                    video_tokens, action_tokens, und_tokens = self.video_module.process_joint_attention(
+                        video_tokens,
+                        action_tokens,
+                        video_adaln_modulation,
+                        action_adaln_modulation,
+                        layer_idx,
+                        self.action_expert.blocks[layer_idx],
+                        und_tokens,
+                        self.und_expert.blocks[layer_idx],
+                    )
+
+                    video_tokens = self.video_module.process_cross_attention(
+                        video_tokens, video_adaln_params, layer_idx, processed_t5_context
+                    )
+
+                    video_tokens = self.video_module.process_ffn(
+                        video_tokens, video_adaln_modulation, layer_idx
+                    )
+                    action_tokens = self.action_module.process_ffn(
+                        action_tokens, action_adaln_modulation, layer_idx
+                    )
+                    und_tokens = self.und_module.process_ffn(und_tokens, layer_idx)
+
+                video_velocity = self.video_module.apply_output_head(video_tokens, video_head_time_emb)
+                ensure_finite(video_velocity, "wm_video_velocity", step_idx=i)
+
+            video_latent = video_latent + video_velocity * dt
+            video_latent[:, :, 0:1] = condition_frame_latent
+            ensure_finite(video_latent, "wm_video_latent", step_idx=i)
+
+        decoded_frames = self.video_model.decode_video(video_latent)
+        predicted_frames = decoded_frames[:, :, 1:]
+        predicted_frames = (predicted_frames + 1.0) / 2.0
+        predicted_frames = torch.clamp(predicted_frames, 0, 1).float()
+        ensure_finite(predicted_frames, "wm_predicted_frames")
+
+        if return_latent:
+            return predicted_frames, video_latent
+        return predicted_frames
+
     # Alternative inference (DPM++ solver)
     '''
     def inference_step(
