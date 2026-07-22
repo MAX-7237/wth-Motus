@@ -25,8 +25,8 @@ from data.utils.norm import denormalize_actions, load_action_state_normalization
 from utils.vlm_utils import preprocess_vlm_messages
 
 DEFAULT_CONFIGS = {
-    "clean": PROJECT_ROOT / "configs" / "action_following_lerobot_rot6d20_clean_only.yaml",
-    "mix": PROJECT_ROOT / "configs" / "action_following_lerobot_rot6d20_mix_4_1_1_1_1.yaml",
+    "clean": PROJECT_ROOT / "configs" / "action_following_lerobot_rot6d20_clean_only_32a32f.yaml",
+    "mix": PROJECT_ROOT / "configs" / "action_following_lerobot_rot6d20_mix_4_1_1_1_1_32a32f.yaml",
 }
 
 

@@ -4,7 +4,7 @@ set -euo pipefail
 cd /mnt/gyc/wth-Motus
 
 PYTHON="${PYTHON:-/mnt/gyc/miniconda3/envs/motus/bin/python}"
-CONFIG_FILE="${CONFIG_FILE:-configs/action_following_lerobot_rot6d20_mix_4_1_1_1_1.yaml}"
+CONFIG_FILE="${CONFIG_FILE:-configs/action_following_lerobot_rot6d20_mix_4_1_1_1_1_32a32f.yaml}"
 CKPT="${CKPT:-}"
 IMAGE="${IMAGE:-${1:-}}"
 INSTRUCTION="${INSTRUCTION:-${2:-}}"

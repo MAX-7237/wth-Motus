@@ -156,27 +156,35 @@ class UniDiffuserTrainer:
         # Use accelerator to save complete training state
         # This saves model, optimizer, scheduler, dataloader, and RNG states
         self.accelerator.save_state(str(checkpoint_dir))
-        logger.info(f"Checkpoint saved to {checkpoint_dir}")
-        # Also save a config.json alongside weights for reproducibility
-        try:
-            from omegaconf import OmegaConf as _OmegaConf
-            cfg_dict = _OmegaConf.to_container(self.config, resolve=True) if self.config is not None else {}
-            # Filter only requested sections
-            common = cfg_dict.get("common", {})
-            model = cfg_dict.get("model", {})
-            filtered = {
-                "common": common,
-                "action_expert": model.get("action_expert", {}),
-                "und_expert": model.get("und_expert", {}),
-                "time_distribution": model.get("time_distribution", {}),
-                "ema": model.get("ema", {}),
-            }
-            import json as _json
-            with open(checkpoint_dir / "config.json", "w") as f:
-                _json.dump(filtered, f, indent=2)
-            logger.info(f"Wrote config.json to {checkpoint_dir}")
-        except Exception as e:
-            logger.warning(f"Failed to write config.json: {e}")
+        if hasattr(self.accelerator, "wait_for_everyone"):
+            self.accelerator.wait_for_everyone()
+
+        if self.rank == 0:
+            logger.info(f"Checkpoint saved to {checkpoint_dir}")
+            # Also save a config.json alongside weights for reproducibility.
+            # Only rank0 writes this single shared file to avoid concurrent writes.
+            try:
+                from omegaconf import OmegaConf as _OmegaConf
+                cfg_dict = _OmegaConf.to_container(self.config, resolve=True) if self.config is not None else {}
+                # Filter only requested sections
+                common = cfg_dict.get("common", {})
+                model = cfg_dict.get("model", {})
+                filtered = {
+                    "common": common,
+                    "action_expert": model.get("action_expert", {}),
+                    "und_expert": model.get("und_expert", {}),
+                    "time_distribution": model.get("time_distribution", {}),
+                    "ema": model.get("ema", {}),
+                }
+                import json as _json
+                with open(checkpoint_dir / "config.json", "w") as f:
+                    _json.dump(filtered, f, indent=2)
+                logger.info(f"Wrote config.json to {checkpoint_dir}")
+            except Exception as e:
+                logger.warning(f"Failed to write config.json: {e}")
+
+        if hasattr(self.accelerator, "wait_for_everyone"):
+            self.accelerator.wait_for_everyone()
     
     def load_checkpoint(self, checkpoint_path: str, reset_scheduler: bool = True):
         """
@@ -435,7 +443,18 @@ class UniDiffuserTrainer:
         total_time = time.time() - start_time
         if self.rank == 0:
             logger.info(f"UniDiffuser training completed in {total_time:.2f}s ({self.global_step} steps)")
+
+        # save_state() is a distributed/DeepSpeed collective and must be entered by
+        # every rank.  Do not let rank0 perform an extra final save by itself.
+        # If the final step already hit save_interval, the checkpoint was saved in
+        # the loop above; otherwise all ranks save the final step together here.
+        if self.global_step % self.save_interval != 0:
             self.save_checkpoint()
+        elif self.rank == 0:
+            logger.info(
+                f"Final checkpoint_step_{self.global_step} already saved by save_interval; "
+                "skipping duplicate final save."
+            )
 
 def create_model_and_optimizer(config: OmegaConf) -> tuple:
     """Create UniDiffuser model and optimizer from config."""

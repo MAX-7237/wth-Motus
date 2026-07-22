@@ -4,7 +4,7 @@ set -euo pipefail
 cd /mnt/gyc/wth-Motus
 
 PYTHON="${PYTHON:-/mnt/gyc/miniconda3/envs/motus/bin/python}"
-CONFIG_FILE="${CONFIG_FILE:-configs/action_following_lerobot_rot6d20_mix_4_1_1_1_1.yaml}"
+CONFIG_FILE="${CONFIG_FILE:-configs/action_following_lerobot_rot6d20_mix_4_1_1_1_1_32a32f.yaml}"
 CKPT="${CKPT:-}"
 IMAGE="${IMAGE:-${1:-}}"
 INSTRUCTION="${INSTRUCTION:-${2:-}}"
@@ -23,7 +23,7 @@ TEXT_LEN="${TEXT_LEN:-}"
 if [ -z "$IMAGE" ] || [ -z "$INSTRUCTION" ] || [ -z "$ACTIONS" ]; then
     echo "Usage: IMAGE=/path/to/input.png INSTRUCTION='task text' ACTIONS=/path/to/actions.npy bash scripts/infer_mix_wm.sh"
     echo "   or: bash scripts/infer_mix_wm.sh /path/to/input.png 'task text' /path/to/actions.npy"
-    echo "Notes: ACTIONS should be normalized [48,20] or [1,48,20] by default; set ACTIONS_ARE_RAW=1 for raw Rot6D20."
+    echo "Notes: ACTIONS should be normalized [32,20] or [1,32,20] by default; set ACTIONS_ARE_RAW=1 for raw Rot6D20."
     exit 1
 fi
 

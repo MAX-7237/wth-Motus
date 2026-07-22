@@ -2,8 +2,8 @@
 # Define your env settings here 
 # e.g., nccl, network, proxy, etc.
 
-TASK="${TASK:-action_following_rot6d20_clean_only_stage3}"  # Define your task name here
-CONFIG_FILE="${CONFIG_FILE:-configs/action_following_lerobot_rot6d20_clean_only.yaml}"  # Define your dataset config path here
+TASK="${TASK:-action_following_rot6d20_clean_only_32a32f_stage3}"  # Define your task name here
+CONFIG_FILE="${CONFIG_FILE:-configs/action_following_lerobot_rot6d20_clean_only_32a32f.yaml}"  # Define your dataset config path here
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 MASTER_PORT="${MASTER_PORT:-29501}"
 TORCHRUN="${TORCHRUN:-/mnt/gyc/miniconda3/envs/motus/bin/torchrun}"

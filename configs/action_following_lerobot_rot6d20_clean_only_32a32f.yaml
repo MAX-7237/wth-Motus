@@ -2,12 +2,15 @@ common:
   action_dim: 20
   state_dim: 20
 
-  num_video_frames: 8
+  # 32-frame action-following setting:
+  # action_chunk_size = num_video_frames * video_action_freq_ratio = 32 * 1 = 32
+  # Each predicted video frame aligns to one action.
+  num_video_frames: 32
   video_height: 384
   video_width: 320
 
   global_downsample_rate: 1
-  video_action_freq_ratio: 6
+  video_action_freq_ratio: 1
 
 training_mode: "finetune"
 
@@ -121,7 +124,7 @@ logging:
   report_to: "tensorboard"
   wandb_project: "motus_action_following_rot6d20"
   tensorboard_log_dir: "tensorboard_logs"
-  run_name: "action_following_rot6d20_clean_only_stage3"
+  run_name: "action_following_rot6d20_clean_only_32a32f_stage3"
 
 resume:
   checkpoint_path: null
